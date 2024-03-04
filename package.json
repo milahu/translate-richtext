@@ -1,0 +1,16 @@
+{
+  "name": "translate-richtext",
+  "version": "0.0.1",
+  "description": "translate rich-text documents between human languages, online or offline",
+  "main": "translate_richtext.js",
+  "type": "module",
+  "scripts": {},
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@lezer/html": "^1.3.9",
+    "fast-glob": "^3.3.2",
+    "he": "^1.2.0"
+  }
+}
