@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// FIXME nodeTypeId is not stable
+
 // https://github.com/tree-sitter/py-tree-sitter/issues/202
 // py-tree-sitter is 10x slower than lezer-parser
 
@@ -768,7 +770,7 @@ const inputHtml = `
       // similar to python repr(...)
       //const s = "'" + JSON.stringify(nodeSource).slice(1, -1).replace(/\\"/g, '"') + "'";
       //const s = JSON.stringify(nodeSource).slice(0, 100);
-      console.log(`node ${String(node.type.id).padStart(2)} = ${node.type.name.padEnd(15)} : ${nodeSource.padEnd(maxLen)} : ${spaceNodeSource}`);
+      console.log(`node ${String(node.type.id).padStart(2)} = ${node.type.name.padEnd(25)} : ${nodeSource.padEnd(maxLen)} : ${spaceNodeSource}`);
       lastNodeTo = node.to;
     });
     return;
@@ -825,10 +827,15 @@ const inputHtml = `
   //function newTag(parent) {
   function newTag() {
     const tag = {
-      name: undefined,
+      openSpace: null,
+      open: null,
+      nameSpace: null,
+      name: null,
       attrs: [],
-      //parent,
-      lang: undefined,
+      classList: [],
+      parent: null,
+      lang: null,
+      ol: null, // original language
       // this tag (or a parent tag) has one of these attributes:
       //   class="... notranslate ..."
       //   style="... display:none ..."
@@ -839,14 +846,14 @@ const inputHtml = `
   }
 
   lastNodeTo = 0;
-  let doTranslate = true;
+  let inNotranslateBlock = false;
   let currentTag = undefined;
-  let currentAttrName = undefined;
-  let currentAttrNameSpace = "";
-  let currentAttrIs = undefined;
-  let currentAttrIsSpace = "";
-  let currentAttrValueQuoted = undefined;
-  let currentAttrValue = undefined;
+  let attrName = undefined;
+  let attrNameSpace = "";
+  let attrIs = undefined;
+  let attrIsSpace = "";
+  let attrValueQuoted = undefined;
+  let attrValue = undefined;
   let currentLang = undefined;
   const textToTranslateList = [];
   let outputTemplateHtml = "";
@@ -879,16 +886,25 @@ const inputHtml = `
   }
 
   function nodeSourceIsEndOfSentence(nodeSource) {
-    return nodeSource.match(/[.!?]["]?\s*/s) != null;
+    return nodeSource.match(/[.!?]["]?\s*$/s) != null;
   }
 
-  function shouldTranslateCurrentTag(currentTag, doTranslate, currentLang, targetLang) {
+  function shouldTranslateCurrentTag(currentTag, inNotranslateBlock, currentLang, targetLang) {
     return (
-      doTranslate == true &&
-      currentTag.notranslate != true && // undefined == false
-      currentTag.hasTranslation == false &&
-      currentLang != targetLang
+      inNotranslateBlock == false &&
+      currentTag.notranslate != true &&
+      // TODO remove. moved to currentTag.notranslate
+      //currentTag.hasTranslation == false &&
+      currentTag.lang != targetLang
+      // TODO remove. lang inheritance moved to newTag()
+      //currentLang != targetLang
     );
+  }
+
+  function writeComment(...a) {
+    return;
+    const s = a.map(String).join(" ");
+    outputTemplateHtml += "\n<!-- " + s + " -->\n";
   }
 
   // walkHtmlTree rootNode
@@ -939,13 +955,13 @@ const inputHtml = `
     }
 
     if (nodeSource == '<!-- <notranslate> -->') {
-      doTranslate = false;
+      inNotranslateBlock = true;
       outputTemplateHtml += `${nodeSourceSpaceBefore}${nodeSource}`;
       lastNodeTo = node.to;
       return;
     }
     else if (nodeSource == '<!-- </notranslate> -->') {
-      doTranslate = true;
+      inNotranslateBlock = false;
       outputTemplateHtml += `${nodeSourceSpaceBefore}${nodeSource}`;
       lastNodeTo = node.to;
       return;
@@ -963,6 +979,8 @@ const inputHtml = `
     4 = EndTag: >
     */
 
+    // start of open tag
+    // "<"
     if (
       nodeTypeName == "StartTag"
       /*
@@ -971,7 +989,7 @@ const inputHtml = `
       nodeTypeId == 10 || // <link>
       false
       */
-    ) { // StartTag
+    ) {
       if (
         !(
           nodeTypeId == 6 ||
@@ -987,18 +1005,34 @@ const inputHtml = `
       const parentTag = currentTag;
       currentTag = newTag();
       if (parentTag) {
-        // inherit parent value of notranslate
+        // inherit notranslate from parent
         // TODO if (notranslate == true) then notranslate should be read-only
         // so when (notranslate == true) then all child nodes are not translated
         currentTag.notranslate = parentTag.notranslate;
+        currentTag.lang = parentTag.lang;
+        currentTag.parent = parentTag;
       }
+      // no. notranslate blocks are outside of the html node tree
+      // if (inNotranslateBlock) {
+      //   currentTag.notranslate = true;
+      // }
       tagPath.push(currentTag);
       inStartTag = true;
       // not needed?
       // buffer the StartTag nodes before output
       // so we can modify nodes like the AttributeName + AttributeValue nodes lang="..."
       //startTagNodes = [];
+
+      currentTag.openSpace = nodeSourceSpaceBefore;
+      currentTag.open = nodeSource;
+
+      // don't write. wait for end of start tag
+      lastNodeTo = node.to;
+      return;
     }
+
+    // start of close tag
+    // "</"
     else if (
       nodeTypeName == "StartCloseTag"
     ) {
@@ -1017,6 +1051,8 @@ const inputHtml = `
         htmlBetweenReplacementsList.push("");
       }
     }
+
+    // elif node_type_id == node_kind[">"] or node_type_id == node_kind["/>"]:
     else if (
       //nodeTypeName == "EndTag"
       nodeTypeId == 4
@@ -1028,17 +1064,189 @@ const inputHtml = `
         process.exit(1);
       }
       */
+
+      if (inStartTag) {
+        // end of start tag
+        if (showDebug) {
+          console.log(`node ${nodeTypeId}: end of start tag -> inStartTag=False`);
+        }
+        // process and write the start tag
+
+        writeComment(JSON.stringify({
+          "tagPath": tagPath.map(t => "/" + (t.name || "(noname)")).join(""),
+          "currentTag.name": currentTag.name,
+          "currentTag.notranslate": currentTag.notranslate,
+          "currentTag.attrs": currentTag.attrs.map(a => a.join("")),
+        }, null, 2));
+
+        // write " <someName"
+        outputTemplateHtml += (
+          // " <"
+          currentTag.openSpace + currentTag.open +
+          // "someName"
+          currentTag.nameSpace + currentTag.name +
+          ""
+        );
+
+        //if (currentTag.notranslate) {
+        if (!shouldTranslateCurrentTag(currentTag, inNotranslateBlock, currentLang, targetLang)) {
+          // preserve attributes
+          currentTag.attrs.forEach(attrItem => {
+            outputTemplateHtml += attrItem.join("");
+          });
+        } else {
+          // modify attributes
+          currentTag.attrs.forEach(attrItem => {
+            let [
+              attrNameSpace,
+              attrName,
+              attrIsSpace,
+              attrIs,
+              attrValueSpace,
+              attrValueQuote,
+              attrValue,
+              attrValueQuote2
+            ] = attrItem;
+
+            // modify attribute
+            if (attrName === "lang") {
+              attrValue = targetLang;
+            }
+
+
+
+            // translate the AttributeValue in some cases
+            // <meta name="description" content="...">
+            // <meta name="keywords" content="...">
+            // <div title="...">...</div>
+            // other <meta> tags are already guarded by <notranslate>
+            if (
+              (translateTitleAttr && attrName == "title") ||
+              (translateMetaContent && currentTag.name == 'meta' && attrName == "content") ||
+              false
+            ) {
+              //const metaName = (currentTag.attrs.find(([name, _value]) => name == "name") || [])[1];
+              //const metaContent = (currentTag.attrs.find(([name, _value]) => name == "content") || [])[1];
+              //if (metaName && metaContent) {
+              //console.log(`TODO translate this meta tag`);
+              // TODO future: add/replace attribute: data-sl="de#somehash" or data-sl="en#somehash"
+              // TODO future: remove the "lang" attribute
+              // if the tag has the same language as the document <html lang="...">
+              // sl = source language
+              // somehash = the sha1 hash of the trimmed source
+              //outputHtml += nodeSource;
+              // TODO tolerate collisions from trimming whitespace?
+              //const nodeSourceTrimmed = trimNodeSource(nodeSource);
+
+              let attrValueHash = sha1sum(attrValue);
+              let textIdx = textToTranslateList.length;
+              let nodeSourceKey = `${textIdx}_${currentLang}_${attrValueHash}`;
+              let todoRemoveEndOfSentence = 0;
+
+              if (!nodeSourceIsEndOfSentence(attrValue)) {
+                attrValue += ".";
+                todoRemoveEndOfSentence = 1;
+              }
+
+              const translationKey = currentLang + ":" + targetLang + ":" + attrValueHash;
+
+              const todoAddToTranslationsDatabase = (translationKey in translationsDatabase) ? 0 : 1;
+
+              if (currentLang === null) {
+                let sourceStart = nodeSource.slice(0, 100);
+                // TODO show "outerHTML". this is only the text node
+                throw new Error(`node has no lang attribute: ${sourceStart}`);
+              }
+
+              let textToTranslate = [
+                textIdx,
+                attrValueHash,
+                currentLang,
+                attrValue,
+                todoRemoveEndOfSentence,
+                todoAddToTranslationsDatabase,
+              ];
+
+              textToTranslateList.push(textToTranslate);
+
+              // store outputHtml between the last replacement and this replacment
+              const htmlBetweenReplacements = [
+                outputTemplateHtml.slice(lastReplacementEnd), // wrong?
+                attrNameSpace,
+                attrName,
+                attrIsSpace,
+                attrIs,
+                attrValueSpace,
+                attrValueQuote,
+                //attrValue,
+                //attrValueQuote,
+              ].join("");
+              if (showDebug) {
+                console.log(1170, "htmlBetweenReplacementsList.push", JSON.stringify(htmlBetweenReplacements));
+              }
+              htmlBetweenReplacementsList.push(htmlBetweenReplacements);
+
+              attrValue = `{TODO_translate_${nodeSourceKey}}`;
+
+              // store end position of attrValue
+              //lastReplacementEnd = outputTemplateHtml.length + (attrNameSpace + attrName + attrIsSpace + attrIs + attrValueSpace + attrValueQuote + attrValue).length;
+              lastReplacementEnd = lastReplacementEnd + htmlBetweenReplacements.length + attrValue.length;
+              // lastReplacementEnd = lastReplacementEnd + ([
+              //   //outputTemplateHtml.slice(lastReplacementEnd),
+              //   attrNameSpace,
+              //   attrName,
+              //   attrIsSpace,
+              //   attrIs,
+              //   attrValueSpace,
+              //   attrValueQuote,
+              //   attrValue,
+              //   //attrValueQuote,
+              // ].join("")).length;
+            }
+
+
+
+            // write attribute
+            let newAttrItem = [
+              attrNameSpace,
+              attrName,
+              attrIsSpace,
+              attrIs,
+              attrValueSpace,
+              attrValueQuote,
+              attrValue,
+              attrValueQuote,
+            ];
+            outputTemplateHtml += newAttrItem.join("");
+
+            if (
+              attrName === "lang" &&
+              currentTag.lang != targetLang &&
+              currentTag.ol === null
+            ) {
+              // add "ol" attribute after "lang" attribute
+              outputTemplateHtml += ` ol="${currentTag.lang}"`;
+            }
+          });
+        }
+      }
+
+
+
       if (
+        // self-closing tag "<br>"
         (
-          inStartTag == true && // EndTag of StartTag
+          inStartTag == true &&
           isSelfClosingTagName(currentTag.name)
         ) ||
-        inStartTag == false // EndTag of StartCloseTag
+        // close tag "</div>"
+        inStartTag == false
       ) {
         tagPath.pop();
         //console.error(`- tagPath=/${tagPath.map(tag => tag.name).join('/')}`)
         currentTag = tagPath[tagPath.length - 1];
         // set currentLang of next parent tag with (tag.lang != undefined)
+        // TODO remove. lang inheritance moved to newTag()
         currentLang = undefined;
         for (let i = tagPath.length - 1; i >= 0; i--) {
           if (tagPath[i].lang) {
@@ -1049,25 +1257,33 @@ const inputHtml = `
       }
       inStartTag = false;
     }
-    else if (inStartTag && nodeTypeId == 22) { // TagName in StartTag
+
+    // TagName in StartTag
+    else if (inStartTag && nodeTypeId == 22) {
+      currentTag.nameSpace = nodeSourceSpaceBefore;
       currentTag.name = nodeSource;
       //console.error(`+ tagPath=/${tagPath.map(tag => tag.name).join('/')}`)
+      if (inStartTag) {
+        // dont write. wait for end of start tag
+        lastNodeTo = node.to;
+        return;
+      }
     }
-    else if (nodeTypeId == 24) { // AttributeName in StartTag
+
+    // AttributeName in StartTag
+    else if (nodeTypeId == 24) {
       inAttributeValue = false;
-      currentAttrName = nodeSource;
-      currentAttrNameSpace = nodeSourceSpaceBefore;
-      // dont output the AttributeName node yet
-      // wait for AttributeValue
+      attrName = nodeSource;
+      attrNameSpace = nodeSourceSpaceBefore;
+      // dont write. wait for end of start tag
       lastNodeTo = node.to;
       return;
     }
     // Is ("=") in StartTag
     else if (inStartTag && nodeTypeName == "Is") {
-      // dont output the Is node yet
-      // wait for AttributeValue
-      currentAttrIs = nodeSource;
-      currentAttrIsSpace = nodeSourceSpaceBefore;
+      // dont write. wait for end of start tag
+      attrIs = nodeSource;
+      attrIsSpace = nodeSourceSpaceBefore;
       lastNodeTo = node.to;
       return;
     }
@@ -1075,22 +1291,42 @@ const inputHtml = `
     else if (nodeTypeId == 26) {
       // needed to filter EntityReference in AttributeValue
       inAttributeValue = true;
-      const quote = (
+      const attrValueSpace = nodeSourceSpaceBefore;
+      const attrValueQuote = (
         (
           nodeSource[0] == "'" ||
           nodeSource[0] == '"'
         ) ? nodeSource[0] // value is quoted
         : "" // value is unquoted
       );
-      currentAttrValueQuoted = nodeSource; // keep quotes around value
-      currentAttrValue = nodeSource.slice(1, -1); // remove quotes from value
-      currentTag.attrs.push([currentAttrName, currentAttrValueQuoted]);
+      attrValueQuoted = nodeSource;
+      attrValue = (attrValueQuote == "") ? nodeSource : nodeSource.slice(1, -1);
+      // TODO push all tokens
+      //currentTag.attrs.push([attrName, attrValueQuoted]);
+      const attrItem = [
+        attrNameSpace,
+        attrName,
+        attrIsSpace,
+        attrIs,
+        attrValueSpace,
+        attrValueQuote,
+        attrValue,
+        attrValueQuote,
+      ];
+      // current_tag.attrs.append(attr_item)
+      currentTag.attrs.push(attrItem);
 
-      //console.log(`${nodeTypeId} = ${node.type.name}: currentAttrName=${currentAttrName}`);
+      //console.log(`${nodeTypeId} = ${node.type.name}: attrName=${attrName}`);
 
-      if (currentAttrName == "lang") {
+      // if attr_name == "lang":
+      //     current_tag.lang = attr_value
+      //     current_lang = attr_value
+      //     if current_tag.lang == target_lang:
+      //         current_tag.notranslate = True
+
+      if (attrName == "lang") {
         // slice(1, -1): remove quotes from "some_value"
-        currentTag.lang = currentAttrValue;
+        currentTag.lang = attrValue;
         currentLang = currentTag.lang;
 
         // not: modify the source
@@ -1103,24 +1339,35 @@ const inputHtml = `
         return;
         */
 
-        if (currentLang != targetLang) {
-          const nodeSourceNew = quote + targetLang + quote;
-          // modify the lang="..." attribute
-          // debug
-          false && console.log(`AttributeValue:`, {
-            currentAttrNameSpace, currentAttrName,
-            currentAttrIsSpace, currentAttrIs,
-            nodeSourceSpaceBefore, nodeSourceNew,
-          })
-          outputTemplateHtml += (
-            currentAttrNameSpace + currentAttrName +
-            currentAttrIsSpace + currentAttrIs +
-            nodeSourceSpaceBefore + nodeSourceNew
-          );
-          // stop processing this AttributeValue
-          lastNodeTo = node.to;
-          return;
-        }
+        //     if current_tag.lang == target_lang:
+        //         current_tag.notranslate = True
+
+        // no. wrong!
+        // TODO move
+        // if (currentLang == targetLang) {
+        //   currentTag.notranslate = true;
+        // }
+
+// TODO move
+        // if (currentLang != targetLang) {
+        //   const nodeSourceNew = attrValueQuote + targetLang + attrValueQuote;
+        //   // modify the lang="..." attribute
+        //   // debug
+        //   false && console.log(`AttributeValue:`, {
+        //     attrNameSpace, attrName,
+        //     attrIsSpace, attrIs,
+        //     nodeSourceSpaceBefore, nodeSourceNew,
+        //   })
+        //   outputTemplateHtml += (
+        //     attrNameSpace + attrName +
+        //     attrIsSpace + attrIs +
+        //     nodeSourceSpaceBefore + nodeSourceNew
+        //   );
+        //   // stop processing this AttributeValue
+        //   lastNodeTo = node.to;
+        //   return;
+        // }
+
         // else: currentLang == targetLang
         // -> keep the lang="..." attribute
         // TODO verify
@@ -1128,155 +1375,142 @@ const inputHtml = `
         else {
           // clear the output buffer
           outputHtml += (
-            currentAttrNameSpace + currentAttrName +
-            currentAttrIsSpace + currentAttrIs
+            attrNameSpace + attrName +
+            attrIsSpace + attrIs
           );
         }
         */
       }
 
+      // # ol = original language
+      // elif attr_name == "ol":
+      //     current_tag.ol = attr_value
+
+      else if (attrName == "ol") {
+        currentTag.ol = attrValue;
+      }
+
+
+
+      // # ignore tags with attribute: class="notranslate"
+      // elif attr_name == "class":
+      //     #class_list = set(attr_value.split())
+      //     class_list = attr_value.split()
+      //     current_tag.class_list += class_list
+      //     if "notranslate" in class_list:
+      //         current_tag.notranslate = True
+
       // ignore tags with attribute: class="notranslate"
-      else if (currentAttrName == "class") {
-        //const classList = new Set(currentAttrValue.split(/\s+/).filter(Boolean));
-        const classList = currentAttrValue.split(/\s+/).filter(Boolean);
-        //console.dir({ currentAttrValueQuoted, classList: Array.from(classList) })
+      else if (attrName == "class") {
+        //const classList = new Set(attrValue.split(/\s+/).filter(Boolean));
+        const classList = attrValue.split(/\s+/).filter(Boolean);
+        //console.dir({ attrValueQuoted, classList: Array.from(classList) })
+
+        currentTag.classList.push(...classList);
 
         //if (classList.has("notranslate")) {
         if (classList.includes("notranslate")) {
           currentTag.notranslate = true;
-          // stop processing this AttributeValue
-          outputTemplateHtml += (
-            currentAttrNameSpace + currentAttrName +
-            currentAttrIsSpace + currentAttrIs +
-            nodeSourceSpaceBefore + nodeSource
-          );
-          lastNodeTo = node.to;
-          return;
+          // TODO move
+          // // stop processing this AttributeValue
+          // outputTemplateHtml += (
+          //   attrNameSpace + attrName +
+          //   attrIsSpace + attrIs +
+          //   nodeSourceSpaceBefore + nodeSource
+          // );
+          // lastNodeTo = node.to;
+          // return;
         }
       }
 
+
+
+      // # ignore tags with attribute: src-lang-id="..."
+      // elif attr_name == "src-lang-id":
+      //     if attr_value.startswith(target_lang + ":"):
+      //         #current_tag.has_translation = True
+      //         current_tag.notranslate = True
+
       // ignore tags with attribute: src-lang-id="..."
-      else if (currentAttrName == "src-lang-id") {
-        if (currentAttrValue.startsWith(targetLang + ":")) {
+      else if (attrName == "src-lang-id") {
+        if (attrValue.startsWith(targetLang + ":")) {
           // src-lang-id="en:some-id"
-          currentTag.hasTranslation = true;
-          // stop processing this AttributeValue
-          outputTemplateHtml += (
-            currentAttrNameSpace + currentAttrName +
-            currentAttrIsSpace + currentAttrIs +
-            nodeSourceSpaceBefore + nodeSource
-          );
-          lastNodeTo = node.to;
-          return;
+          //currentTag.hasTranslation = true;
+          currentTag.notranslate = true;
+          // TODO move
+          // // stop processing this AttributeValue
+          // outputTemplateHtml += (
+          //   attrNameSpace + attrName +
+          //   attrIsSpace + attrIs +
+          //   nodeSourceSpaceBefore + nodeSource
+          // );
+          // lastNodeTo = node.to;
+          // return;
         }
       }
+
+
+
+      // # ignore tags with attribute: style="display:none"
+      // # TODO also ignore all child nodes of such tags
+      // elif attr_name == "style":
+      //     # TODO parse CSS. this can be something stupid like
+      //     # style="/*display:none*/"
+      //     # TODO regex
+      //     # currentAttrValue.match(/.*\b(display\s*:\s*none)\b.*/s) != null
+      //     if attr_value == "display:none" or "display: none" in attr_value:
+      //         current_tag.notranslate = True
 
       // ignore tags with attribute: style="display:none"
       // TODO also ignore all child nodes of such tags
-      else if (currentAttrName == "style") {
+      else if (attrName == "style") {
         if (
-          currentAttrValue == "display:none" ||
+          //attrValue == "display:none" ||
           // TODO parse CSS. this can be something stupid like
           // style="/*display:none*/"
           // \b = word boundary
-          currentAttrValue.match(/.*\b(display\s*:\s*none)\b.*/s) != null
+          attrValue.match(/.*\b(display\s*:\s*none)\b.*/s) != null
         ) {
           // TODO inherit this to all child nodes
           currentTag.notranslate = true;
 
-          // stop processing this AttributeValue
-          outputTemplateHtml += (
-            currentAttrNameSpace + currentAttrName +
-            currentAttrIsSpace + currentAttrIs +
-            nodeSourceSpaceBefore + nodeSource
-          );
-          lastNodeTo = node.to;
-          return;
+          // // stop processing this AttributeValue
+          // outputTemplateHtml += (
+          //   attrNameSpace + attrName +
+          //   attrIsSpace + attrIs +
+          //   nodeSourceSpaceBefore + nodeSource
+          // );
+          // lastNodeTo = node.to;
+          // return;
         }
       }
+
       /*
       else {
         // clear the output buffer
         outputHtml += (
-          currentAttrNameSpace + currentAttrName +
-          currentAttrIsSpace + currentAttrIs
+          attrNameSpace + attrName +
+          attrIsSpace + attrIs
         );
       }
       */
 
-      // clear the output buffer
-      outputTemplateHtml += (
-        currentAttrNameSpace + currentAttrName +
-        currentAttrIsSpace + currentAttrIs
-      );
 
-      // translate the AttributeValue in some cases
-      // <meta name="description" content="...">
-      // <meta name="keywords" content="...">
-      // <div title="...">...</div>
-      // other <meta> tags are already guarded by <notranslate>
-      //if (doTranslate && currentTag.notranslate != true && currentTag.hasTranslation == false && currentLang != targetLang) {
-      if (shouldTranslateCurrentTag(currentTag, doTranslate, currentLang, targetLang)) {
-        if (
-          (translateTitleAttr && currentAttrName == "title") ||
-          (translateMetaContent && currentTag.name == 'meta' && currentAttrName == "content") ||
-          false
-        ) {
-          //const metaName = (currentTag.attrs.find(([name, _value]) => name == "name") || [])[1];
-          //const metaContent = (currentTag.attrs.find(([name, _value]) => name == "content") || [])[1];
-          //if (metaName && metaContent) {
-          //console.log(`TODO translate this meta tag`);
-          // TODO future: add/replace attribute: data-sl="de#somehash" or data-sl="en#somehash"
-          // TODO future: remove the "lang" attribute
-          // if the tag has the same language as the document <html lang="...">
-          // sl = source language
-          // somehash = the sha1 hash of the trimmed source
-          //outputHtml += nodeSource;
-          // TODO tolerate collisions from trimming whitespace?
-          //const nodeSourceTrimmed = trimNodeSource(nodeSource);
-          let nodeSourceTrimmed = nodeSource.slice(1, -1); // slice: remove quotes
-          const nodeSourceTrimmedHash = sha1sum(nodeSourceTrimmed);
-          const textIdx = textToTranslateList.length;
-          const nodeSourceKey = `${textIdx}_${currentLang}_${nodeSourceTrimmedHash}`;
-          let todoRemoveEndOfSentence = 0;
+      // #print("attr_name", __line__(), repr(attr_name))
 
-          if (
-            nodeSourceIsEndOfSentence(nodeSourceTrimmed) == false &&
-            isSentenceTag(currentTag)
-          ) {
-            nodeSourceTrimmed += ".";
-            todoRemoveEndOfSentence = 1;
-          }
+      // attr_name = None
 
-          const translationKey = currentLang + ":" + targetLang + ":" + nodeSourceTrimmedHash;
+      // # dont write. wait for end of start tag
+      // last_node_to = node.range.end_byte
+      // continue
+      lastNodeTo = node.to;
+      return;
 
-          const todoAddToTranslationsDatabase = (
-            translationsDatabase.hasOwnProperty(translationKey) == false
-          ) ? 1 : 0;
-
-          const textToTranslate = [
-            textIdx,
-            nodeSourceTrimmedHash,
-            currentLang,
-            nodeSourceTrimmed,
-            todoRemoveEndOfSentence,
-            todoAddToTranslationsDatabase,
-          ];
-
-          textToTranslateList.push(textToTranslate);
-
-          // store outputHtml between the last replacement and this replacment
-          htmlBetweenReplacementsList.push(outputTemplateHtml.slice(lastReplacementEnd) + quote);
-          // TODO store context of replacement: attribute value with quotes (single or double quotes?)
-          // then escape the quotes in the translated text
-          outputTemplateHtml += `${quote}{TODO_translate_${nodeSourceKey}}${quote}`;
-          lastReplacementEnd = outputTemplateHtml.length - 1;
-          lastNodeTo = node.to;
-          return;
-        }
-      }
-
-
+      // // clear the output buffer
+      // outputTemplateHtml += (
+      //   attrNameSpace + attrName +
+      //   attrIsSpace + attrIs
+      // );
 
     }
 
@@ -1326,7 +1560,8 @@ const inputHtml = `
         return;
       }
 
-      if (shouldTranslateCurrentTag(currentTag, doTranslate, currentLang, targetLang)) {
+      if (shouldTranslateCurrentTag(currentTag, inNotranslateBlock, currentLang, targetLang)) {
+      //if (currentTag.notranslate == false && currentLang != targetLang) {
         // TODO also compare source and target language
         // if they are equal, no need to translate
         // TODO remove whitespace? trimNodeSource
@@ -1368,8 +1603,16 @@ const inputHtml = `
 
         // console.dir({ translationKey, textToTranslateList }); throw new Error("todo");
 
+        const htmlBetweenReplacements = (
+          outputTemplateHtml.slice(lastReplacementEnd) + nodeSourceSpaceBefore
+        );
+
+        if (showDebug) {
+          console.log(1570, "htmlBetweenReplacementsList.push", JSON.stringify(htmlBetweenReplacements));
+        }
+
         // store outputHtml between the last replacement and this replacment
-        htmlBetweenReplacementsList.push(outputTemplateHtml.slice(lastReplacementEnd) + nodeSourceSpaceBefore);
+        htmlBetweenReplacementsList.push(htmlBetweenReplacements);
         // TODO store context of replacement: attribute value with quotes (single or double quotes?)
         // then escape the quotes in the translated text
         outputTemplateHtml += `${nodeSourceSpaceBefore}{TODO_translate_${nodeSourceKey}}`;
@@ -1382,7 +1625,7 @@ const inputHtml = `
     if (nodeTypeId == 39) { // Comment
       if (
         translateComments == false ||
-        shouldTranslateCurrentTag(currentTag, doTranslate, currentLang, targetLang) == false
+        shouldTranslateCurrentTag(currentTag, inNotranslateBlock, currentLang, targetLang) == false
       ) {
         outputTemplateHtml += nodeSourceSpaceBefore + nodeSource;
         lastNodeTo = node.to;
@@ -1404,7 +1647,8 @@ const inputHtml = `
         return;
       }
 
-      if (shouldTranslateCurrentTag(currentTag, doTranslate, currentLang, targetLang)) {
+      if (shouldTranslateCurrentTag(currentTag, inNotranslateBlock, currentLang, targetLang)) {
+      //if (currentTag.notranslate == false && currentLang != targetLang) {
         // TODO also compare source and target language
         // if they are equal, no need to translate
         let nodeSourceTrimmed = commentContent;
@@ -1438,8 +1682,16 @@ const inputHtml = `
 
         textToTranslateList.push(textToTranslate);
 
+        const htmlBetweenReplacements = (
+          outputTemplateHtml.slice(lastReplacementEnd) + nodeSourceSpaceBefore + '<!--'
+        );
+
+        if (showDebug) {
+          console.log(1640, "htmlBetweenReplacementsList.push", JSON.stringify(htmlBetweenReplacements));
+        }
+
         // store outputHtml between the last replacement and this replacment
-        htmlBetweenReplacementsList.push(outputTemplateHtml.slice(lastReplacementEnd) + nodeSourceSpaceBefore + '<!--');
+        htmlBetweenReplacementsList.push(htmlBetweenReplacements);
         // TODO store context of replacement: attribute value with quotes (single or double quotes?)
         // then escape the quotes in the translated text
         outputTemplateHtml += `${nodeSourceSpaceBefore}<!--{TODO_translate_${nodeSourceKey}}-->`;
@@ -1462,7 +1714,13 @@ const inputHtml = `
   // walkHtmlTree rootNode end
 
   // html after the last replacement
-  htmlBetweenReplacementsList.push(outputTemplateHtml.slice(lastReplacementEnd));
+  const htmlBetweenReplacements = (
+    outputTemplateHtml.slice(lastReplacementEnd)
+  );
+  if (showDebug) {
+    console.log(1670, "htmlBetweenReplacementsList.push", JSON.stringify(htmlBetweenReplacements));
+  }
+  htmlBetweenReplacementsList.push(htmlBetweenReplacements);
 
   const outputTemplateHtmlPath = inputPath + '.' + inputHtmlHash + '.outputTemplate.html';
   console.error(`writing ${outputTemplateHtmlPath}`);
@@ -1557,6 +1815,8 @@ const inputHtml = `
     // also because we send lines to the translator, to get the "splitted" translation
     // so we need a way to encode text blocks
 
+    //console.log(`textToTranslate[3]`, JSON.stringify(textToTranslate[3])); // debug
+
     // TODO? add source language sl="..."
     const textToTranslateHtml = `<html i="${textToTranslate[0]}" h="${textToTranslate[1]}" rme="${textToTranslate[4]}" add="${textToTranslate[5]}">\n${textToTranslate[3]}\n</html>`;
 
@@ -1598,6 +1858,8 @@ const inputHtml = `
       'sgu'
     );
 
+    //console.log(`textToTranslateHtml`, JSON.stringify(textToTranslateHtml)); // debug
+
     // encode html
     // replace html tags with "symbols in square braces"
     // consume all whitespace around the source text
@@ -1616,6 +1878,7 @@ const inputHtml = `
         const textBeforeMatch = (
           textToTranslateHtml.slice(lastMatchEnd, matchPos)
         );
+        console.log(`textBeforeMatch`, JSON.stringify(textBeforeMatch)); // debug
         if (textBeforeMatch != "") {
           textPartRawList.push([
             textBeforeMatch,
@@ -1624,6 +1887,7 @@ const inputHtml = `
         }
         // see also: getReplace
         const replacementId = replacementData_lastId_2 + 1;
+        console.log(`match`, JSON.stringify(match)); // debug
         textPartRawList.push([
           match,
           1, // isReplacement
@@ -1993,7 +2257,9 @@ const inputHtml = `
 
           // remove text-parts from last group
           //textGroupsRaw[textGroupsRaw.length - 2] = textGroupsRaw[textGroupsRaw.length - 2].slice(0, lastGroupEndGroupIdx);
-          textGroupsRaw[textGroupsRaw.length - 2] = textGroupsRaw[textGroupsRaw.length - 2].slice(0, lastGroupEndGroupIdx + 1);
+          textGroupsRaw[textGroupsRaw.length - 2] = (
+            textGroupsRaw[textGroupsRaw.length - 2].slice(0, lastGroupEndGroupIdx + 1)
+          );
 
           // stats
           const lastGroupSizeAfter = stringifyRawTextGroup(textGroupsRaw[textGroupsRaw.length - 2]).length;

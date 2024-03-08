@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 
-# FIXME leading and trailing whitespace is lost when it should be part of text nodes
+# TODO export_lang must decode html entities to utf8
+# TODO import_lang must encode html entities from utf8
+
+# fixed: leading and trailing whitespace is lost when it should be part of text nodes
 # this gives a different result than translate-richtext.js
 # https://github.com/tree-sitter/tree-sitter-html/issues/87
+# fixed in
+# https://github.com/tree-sitter/tree-sitter-html/pull/89
 
 import os
 import sys
@@ -17,18 +22,14 @@ import hashlib
 import subprocess
 import html
 import urllib.parse
-import html.entities as html_entities
+import ast
 
-#from lezer import parser as lezerParserHtml
-# https://pypi.org/project/tree-sitter/
-# https://til.simonwillison.net/python/tree-sitter
-import tree_sitter
 import tree_sitter_languages
 
 tree_sitter_html = tree_sitter_languages.get_parser("html")
 
 """
-text = "<b>asdf</b>"
+text = b"<b>asdf</b>"
 tree = tree_sitter_html.parse(text)
 print(tree.root_node.sexp())
 sys.exit()
@@ -37,6 +38,7 @@ sys.exit()
 #from format_error_context import formatErrorContext
 
 show_debug = False
+#show_debug = True
 
 # limit of google, deepl
 char_limit = 5000
@@ -73,6 +75,12 @@ code_num_regex_char_class_import = (
 )
 
 
+# https://stackoverflow.com/a/20372465/10440128
+from inspect import currentframe
+def __line__():
+    cf = currentframe()
+    return cf.f_back.f_lineno
+
 
 def encode_num(num):
     return "ref" + str(num)
@@ -89,31 +97,182 @@ def sha1sum(_bytes):
 # but works with lezer-parser-html
 
 
+# https://github.com/grantjenks/py-tree-sitter-languages/issues/59
+# TODO better? get name-id mappings from parser binary?
+
+# with open(os.environ["TREE_SITTER_HTML_SRC"] + "/src/grammar.json", "r") as f:
+#     tree_sitter_html_grammar = json.load(f)
+# # no. names can be ugly names like '"'
+# # import types
+# # node_kind = types.SimpleNamespace(**{
+# #     name: id for id, name in enumerate(tree_sitter_html_grammar["rules"])
+# # })
+# node_kind = {
+#     name: id for id, name in enumerate(tree_sitter_html_grammar["rules"])
+# }
+# print("node_kind =", json.dumps(node_kind, indent=2))
+
+# parse node name-id mapping from src/parser.c
+
+with open(os.environ["TREE_SITTER_HTML_SRC"] + "/src/parser.c", "rb") as f:
+    parser_c_src = f.read()
+tree_sitter_c = tree_sitter_languages.get_parser("c")
+parser_c_tree = tree_sitter_c.parse(parser_c_src)
+
+def walk_tree(tree):
+    cursor = tree.walk()
+    reached_root = False
+    while reached_root == False:
+        yield cursor.node
+        if cursor.goto_first_child():
+            continue
+        if cursor.goto_next_sibling():
+            continue
+        retracing = True
+        while retracing:
+            if not cursor.goto_parent():
+                retracing = False
+                reached_root = True
+            if cursor.goto_next_sibling():
+                retracing = False
+
+if False:
+
+    # debug: print AST
+
+    node_idx = 0
+    max_len = 30
+
+    for node in walk_tree(parser_c_tree.root_node):
+
+        node_text = json.dumps(node_source)
+        if len(node_text) > max_len:
+            node_text = node_text[0:max_len] + "..."
+
+        #pfx = "# " if is_compound else "  "
+        pfx = ""
+        print(pfx + f"node {node.kind_id:2d} = {node.type:25s} : {node_text:30s}")
+
+        node_idx += 1
+        #if node_idx > 100: break
+
+    sys.exit()
+
+in_enum_ts_symbol_identifiers = False
+in_char_ts_symbol_names = False
+enum_name = None
+current_identifier = None
+enum_ts_symbol_identifiers = dict()
+char_ts_symbol_names = dict()
+
+for node in walk_tree(parser_c_tree.root_node):
+
+    node_source = node.text.decode("utf8")
+
+    if node.type == "type_identifier" and node.text == b"ts_symbol_identifiers":
+        in_enum_ts_symbol_identifiers = True
+        continue
+
+    if node.type == "pointer_declarator" and node.text == b"* const ts_symbol_names[]":
+        in_char_ts_symbol_names = True
+        continue
+
+    if in_enum_ts_symbol_identifiers:
+
+        if node.type == "identifier":
+            current_identifier = node_source
+            continue
+
+        if node.type == "number_literal":
+            enum_ts_symbol_identifiers[current_identifier] = (
+                int(node_source)
+            )
+            current_identifier = None
+            continue
+
+        if node.type == "}":
+            current_identifier = node_source
+            in_enum_ts_symbol_identifiers = False
+            continue
+
+        continue
+
+    if in_char_ts_symbol_names:
+
+        if node.type == "subscript_designator":
+            current_identifier = node_source[1:-1]
+            continue
+
+        if node.type == "string_literal":
+            char_ts_symbol_names[current_identifier] = (
+                ast.literal_eval(node_source)
+            )
+            current_identifier = None
+            continue
+
+        if node.type == "}":
+            current_identifier = node_source
+            in_char_ts_symbol_names = False
+            break
+
+        continue
+
+#print("enum_ts_symbol_identifiers =", json.dumps(enum_ts_symbol_identifiers, indent=2))
+#print("char_ts_symbol_names =", json.dumps(char_ts_symbol_names, indent=2))
+
+# force user to use exact names from full_node_kind
+# names can collide when grammars
+# use the same names for different tokens...
+# example: <!doctype html>
+# both the full tag and the tag_name have the token name "doctype"
+#   sym_doctype = 26, // full doctype tag
+#   sym__doctype = 4, // tag_name of doctype tag
+
+full_node_kind = enum_ts_symbol_identifiers
+node_kind = dict()
+for full_name, id in enum_ts_symbol_identifiers.items():
+    name = char_ts_symbol_names[full_name]
+    if len(list(filter(lambda n: n == name, char_ts_symbol_names.values()))) > 1:
+        # duplicate name
+        # force user to use full_name in full_node_kind
+        # also store full_name in node_kind
+        node_kind[full_name] = id
+        continue
+    node_kind[name] = id
+# allow reverse lookup from id to name
+node_name = [None] + list(node_kind.keys())
+
+if show_debug:
+    #print("full_node_kind =", json.dumps(full_node_kind, indent=2))
+    print("node_kind =", json.dumps(node_kind, indent=2))
+    #print("node_kind document =", node_kind["document"])
 
 # compound tags
 # these are ignored when serializing the tree
 compound_kind_id = set([
-    25, # fragment
-    26, # doctype
-    #1, # '<!'
-    #3, # '>'
-    28, # element
-    29, # script_element
-    30, # style_element
-    31, # start_tag
-    34, # self_closing_tag
-    35, # end_tag
-    37, # attribute
-    38, # quoted_attribute_value
-    #14, # double quote '"'
-    #12, # single quote "'"
-    #10, # attribute_value
+    node_kind["document"],
+    #node_kind["doctype"],
+    full_node_kind["sym_doctype"], # full doctype tag
+    #full_node_kind["sym__doctype"], # tag_name of doctype tag
+    #node_kind["<!"],
+    #node_kind[">"],
+    node_kind["element"],
+    node_kind["script_element"],
+    node_kind["style_element"],
+    node_kind["sym_start_tag"],
+    node_kind["self_closing_tag"],
+    node_kind["end_tag"],
+    node_kind["attribute"],
+    #node_kind["quoted_attribute_value"], # keyerror
+    node_kind['"'], # double quote
+    node_kind["'"], # single quote
+    #node_kind["attribute_value"],
 ])
 
 # https://github.com/tree-sitter/py-tree-sitter/issues/33
 #def traverse_tree(tree: Tree):
 #def walk_html_tree(tree, func, filter_compound_nodes=True):
-def walk_html_tree(tree):
+def walk_html_tree(tree, keep_compound_nodes=False):
     global compound_kind_id
     cursor = tree.walk()
     reached_root = False
@@ -127,7 +286,8 @@ def walk_html_tree(tree):
         #     # dont filter
         #     #yield cursor.node
         #     func(cursor.node, is_compound)
-        if not is_compound:
+        #if not is_compound:
+        if keep_compound_nodes or not is_compound:
             yield cursor.node
             #func(cursor.node) # slow?
         if cursor.goto_first_child():
@@ -144,19 +304,19 @@ def walk_html_tree(tree):
 
 
 
-async def export_lang(input_path, target_lang):
+async def export_lang(input_path, target_lang, output_dir=""):
     # tree-sitter expects binary string
     #with open(input_path, 'r') as f:
     with open(input_path, 'rb') as f:
         input_html_bytes = f.read()
 
     input_html_hash = 'sha1-' + hashlib.sha1(input_html_bytes).hexdigest()
-    input_path_frozen = input_path + '.' + input_html_hash
+    input_path_frozen = output_dir + input_path + '.' + input_html_hash
     print(f'writing {input_path_frozen}')
     with open(input_path_frozen, 'wb') as f:
         f.write(input_html_bytes)
 
-    translations_database_html_path_glob = 'translations-google-database-*-*.html'
+    translations_database_html_path_glob = output_dir + 'translations-google-database-*-*.html'
     translations_database = {}
 
     # parse translation databases
@@ -198,23 +358,25 @@ async def export_lang(input_path, target_lang):
 
         max_len = 30
 
-        for node in walk_html_tree(root_node):
+        for node in walk_html_tree(root_node, keep_compound_nodes=True):
 
-            node_text = json.dumps(node.text.decode("utf8"))
+            is_compound = node.kind_id in compound_kind_id
+
+            node_text = json.dumps(node_source)
             if len(node_text) > max_len:
                 node_text = node_text[0:max_len] + "..."
 
             space_node_text = json.dumps(input_html_bytes[last_node_to:node.range.end_byte].decode("utf8"))
             if len(space_node_text) > max_len:
                 space_node_text = space_node_text[0:max_len] + "..."
-            print(f"node {node.kind_id:2d} = {node.type:15s} : {node_text:30s} : {space_node_text}")
+            pfx = "# " if is_compound else "  "
+            print(pfx + f"node {node.kind_id:2d} = {node.type:25s} : {node_text:30s} : {space_node_text}")
             last_node_to = node.range.end_byte
 
             node_idx += 1
             #if node_idx > 20: raise 123
 
         return
-
 
 
     check_parser_lossless = False
@@ -263,7 +425,7 @@ async def export_lang(input_path, target_lang):
             #walk_html_tree_test_result += node_source_bytes # slow!
             walk_html_tree_test_result.write(node_source_bytes)
 
-            # s = repr(node.text.decode("utf8"))
+            # s = repr(node_source)
             # if len(s) > 50:
             #     s = s[0:50] + "..."
             # node_source = node_source_bytes.decode("utf8")
@@ -284,7 +446,7 @@ async def export_lang(input_path, target_lang):
 
         if walk_html_tree_test_result != input_html_bytes:
             print('error: the tree walker is not lossless')
-            input_path_frozen_error = input_path + '.' + input_html_hash + '.error'
+            input_path_frozen_error = output_dir + input_path + '.' + input_html_hash + '.error'
             print(f'writing {input_path_frozen_error}')
             with open(input_path_frozen_error, 'w') as f:
                 f.write(walk_html_tree_test_result)
@@ -296,28 +458,35 @@ async def export_lang(input_path, target_lang):
         walk_html_tree_test_result = None
 
     class Tag:
-        name = None
-        attrs = []
-        lang = None
-        notranslate = False
-        hasTranslation = False
-        # FIXME these are never set?
-        _from = None
-        to = None
+        def __init__(self):
+            self.open_space = None
+            self.open = None
+            self.name_space = None
+            self.name = None
+            self.attrs = []
+            self.class_list = []
+            self.parent = None
+            self.lang = None
+            self.ol = None # original language
+            self.notranslate = False
+            self.has_translation = False
+            # FIXME these are never set?
+            self._from = None
+            self.to = None
 
     def new_tag():
         return Tag()
 
     last_node_to = 0
-    do_translate = True
+    in_notranslate_block = False
     current_tag = None
-    current_attr_name = None
-    current_attr_name_space = ""
-    current_attr_is = None
-    current_attr_is_space = ""
-    current_attr_value_quote = None
-    current_attr_value_quoted = None
-    current_attr_value = None
+    attr_name = None
+    attr_name_space = ""
+    attr_is = None
+    attr_is_space = ""
+    attr_value_quote = None
+    attr_value_quoted = None
+    attr_value = None
     current_lang = None
     text_to_translate_list = []
     #output_template_html = "" # slow!
@@ -326,33 +495,53 @@ async def export_lang(input_path, target_lang):
     in_start_tag = False
     html_between_replacements_list = []
     last_replacement_end = 0
-    in_doctype_node = True
+    in_doctype_node = False
 
     def is_self_closing_tag_name(tag_name):
         return tag_name in ('br', 'img', 'hr', 'meta', 'link', 'DOCTYPE', 'doctype')
 
     def is_sentence_tag(current_tag):
+        if not current_tag:
+            return False
+        if show_debug:
+            print("current_tag.name", repr(current_tag.name))
         return re.match(r"^(title|h[1-9]|div|li|td)$", current_tag.name) != None
 
+    # function nodeSourceIsEndOfSentence
     def node_source_is_end_of_sentence(node_source):
-        #return re.match(r"""[.!?]["]?\s*""", node_source) != None
-        return re.match(r'[.!?]["]?\s*', node_source) != None
+        return re.search(r'[.!?]["]?\s*$', node_source) != None
 
-    def should_translate_current_tag(current_tag, do_translate, current_lang, target_lang):
+    def should_translate_current_tag(current_tag, in_notranslate_block, current_lang, target_lang):
         return (
-            do_translate and
+            not in_notranslate_block and
             not current_tag.notranslate and
-            not current_tag.hasTranslation and
-            current_lang != target_lang
+            # TODO remove. moved to current_tag.notranslate
+            #not current_tag.has_translation and
+            current_tag.lang != target_lang
+            # TODO remove. lang inheritance moved to new_tag()
+            #current_lang != target_lang
         )
+
+    def write_comment(*a):
+        return
+        s = " ".join(map(str, a))
+        # TODO escape "-->" in s
+        output_template_html.write(f"\n<!-- " + s + " -->\n")
+
+    def format_tag(t):
+        name = t.name or "(noname)"
+        lang = t.lang or "?"
+        translate = "N" if t.notranslate else "Y"
+        return f"{name}.{lang}.{translate}"
+
+    def format_tag_path(tag_path):
+        return "".join(map(lambda t: "/" + format_tag(t), tag_path))
+        #return "".join(map(lambda t: "/" + (t.name or "(noname)"), tag_path))
 
     # def walk_callback(node, is_compound):
     #     if is_compound:
     #         return
     #     # ...
-
-    debug = False
-    #debug = True
 
     # def walk_callback_main
     #def walk_callback(node):
@@ -363,15 +552,15 @@ async def export_lang(input_path, target_lang):
     for node in walk_html_tree(root_node):
 
         # nonlocal last_node_to
-        # nonlocal do_translate
+        # nonlocal in_notranslate_block
         # nonlocal current_tag
-        # nonlocal current_attr_name
-        # nonlocal current_attr_name_space
-        # nonlocal current_attr_is
-        # nonlocal current_attr_is_space
-        # nonlocal current_attr_value_quote
-        # nonlocal current_attr_value_quoted
-        # nonlocal current_attr_value
+        # nonlocal attr_name
+        # nonlocal attr_name_space
+        # nonlocal attr_is
+        # nonlocal attr_is_space
+        # nonlocal attr_value_quote
+        # nonlocal attr_value_quoted
+        # nonlocal attr_value
         # nonlocal current_lang
         # nonlocal text_to_translate_list
         # nonlocal output_template_html
@@ -381,11 +570,6 @@ async def export_lang(input_path, target_lang):
         # nonlocal last_replacement_end
         # nonlocal in_doctype_node
 
-        if debug:
-            s = repr(node.text.decode("utf8"))
-            if len(s) > 500:
-                s = s[0:500] + "..."
-
         # off by one error?
         # or how is ">" added?
         # node_source = input_html_bytes[last_node_to:node.range.end_byte].decode("utf8")
@@ -394,8 +578,29 @@ async def export_lang(input_path, target_lang):
         node_type_id = node.kind_id
         node_type_name = node.type
 
-        node_source = input_html_bytes[node.range.start_byte:node.range.end_byte].decode("utf8")
-        node_source_space_before = input_html_bytes[(last_node_to + 1):node.range.start_byte].decode("utf8")
+        #node_source = input_html_bytes[node.range.start_byte:node.range.end_byte].decode("utf8")
+        node_source = node.text.decode("utf8")
+
+        #node_source_space_before = input_html_bytes[(last_node_to + 1):node.range.start_byte].decode("utf8")
+        node_source_space_before = input_html_bytes[(last_node_to):node.range.start_byte].decode("utf8")
+
+        if show_debug:
+            s = repr(node_source)
+            if len(s) > 500:
+                s = s[0:500] + "..."
+            print(__line__(), "node", format_tag_path(tag_path), node.kind_id, node_name[node.kind_id], repr(node_source_space_before), repr(s))
+
+        def write_node():
+            # copy this node with no changes
+            nonlocal last_node_to
+            output_template_html.write(
+                node_source_space_before + node_source
+            )
+            if show_debug:
+                print("output_template_html.write", __line__(), repr(
+                    node_source_space_before + node_source
+                ))
+            last_node_to = node.range.end_byte
 
         # fix: node_source_space_before == 'html'
         # workaround
@@ -404,15 +609,39 @@ async def export_lang(input_path, target_lang):
         # node 1 = <!: '<!' -> '<!'
         # node 4 = doctype: 'DOCTYPE' -> 'DOCTYPE'
         # node 3 = >: '>' -> '>'
-        if node_type_id == 1 or node_type_id == 4:
+        #if node_type_id == node_kind["<!"]:
+        if node_type_id == node_kind["<!"] or node_type_id == node_kind["sym__doctype"]:
             in_doctype_node = True
-        elif node_type_id == 3 and in_doctype_node == True:
-            in_doctype_node = False
-            node_source = input_html_bytes[(last_node_to + 1):node.range.end_byte].decode("utf8")
-            node_source_space_before = ""
-            last_node_to = node.range.start_byte - 1
+            #last_node_to = node.range.end_byte
+            write_node()
+            continue
 
-        if debug:
+        elif node_type_id == node_kind[">"] and in_doctype_node == True:
+            in_doctype_node = False
+            #in_start_tag = False
+            write_node()
+            continue
+
+            # in_start_tag = False
+            # node_source = input_html_bytes[(last_node_to + 1):node.range.end_byte].decode("utf8")
+            # node_source_space_before = ""
+            # last_node_to = node.range.start_byte - 1
+            # tag_path.pop()
+            # try:
+            #     current_tag = tag_path[-1]
+            # except IndexError:
+            #     current_tag = None
+            # output_template_html.write(
+            #     node_source_space_before + node_source
+            # )
+            # print("output_template_html.write", __line__(), repr(
+            #     node_source_space_before + node_source
+            # ))
+            # # TODO?
+            # last_node_to = node.range.end_byte
+            # continue
+
+        if show_debug:
             s2 = repr(node_source)
             if len(s2) > 500:
                 s2 = s2[0:500] + "..."
@@ -420,7 +649,7 @@ async def export_lang(input_path, target_lang):
 
         # validate node_source_space_before
         if re.match(r"""^\s*$""", node_source_space_before) == None:
-            print("node_source_space_before", repr(node_source_space_before))
+            print("node_source_space_before", __line__(), repr(node_source_space_before))
             print((
                 f'error: node_source_space_before must match the regex "\\s*". ' +
                 'hint: add "last_node_to = node.range.end_byte;" before "return;"'
@@ -436,20 +665,28 @@ async def export_lang(input_path, target_lang):
             sys.exit(1)
 
         if node_source == '<!-- <notranslate> -->':
-            do_translate  = False
+            in_notranslate_block  = True
             #output_template_html += (
             output_template_html.write(
                 node_source_space_before + node_source
             )
+            if show_debug:
+                print("output_template_html.write", __line__(), repr(
+                    node_source_space_before + node_source
+                ))
             last_node_to = node.range.end_byte
             #return
             continue
         elif node_source == '<!-- </notranslate> -->':
-            do_translate = True
+            in_notranslate_block = False
             #output_template_html += (
             output_template_html.write(
                 node_source_space_before + node_source
             )
+            if show_debug:
+                print("output_template_html.write", __line__(), repr(
+                    node_source_space_before + node_source
+                ))
             last_node_to = node.range.end_byte
             #return
             continue
@@ -468,20 +705,43 @@ async def export_lang(input_path, target_lang):
         # if node_type_name == "StartTag":
         # node 1 '<!'
         # node 5 '<'
-        if node_type_id == 1 or node_type_id == 5:
+        if node_type_id == node_kind["<!"] or node_type_id == node_kind["<"]:
             parent_tag = current_tag
+            # if True:
+            #     write_comment(__line__(), f"current_tag = new_tag()")
             current_tag = new_tag()
+            # if True:
+            #     write_comment(__line__(), "current_tag =", repr(current_tag))
+            # if True:
+            #     write_comment(__line__(), "current_tag.attrs =", repr(list(map(lambda a: "".join(a), current_tag.attrs))))
             if parent_tag:
                 # inherit notranslate from parent
                 current_tag.notranslate = parent_tag.notranslate
+                current_tag.lang = parent_tag.lang
+                current_tag.parent = parent_tag
+            # no. notranslate blocks are outside of the html node tree
+            # if in_notranslate_block:
+            #     current_tag.notranslate = True
             tag_path.append(current_tag)
-            if debug:
-                print(f"tag_path += {current_tag.name} -> tag_path: /" + "/".join(map(lambda t: t.name or "(noname)", tag_path)))
+            if show_debug:
+            #if True:
+                #write_comment(__line__(), f"tag_path += {current_tag.name} -> tag_path: " + format_tag_path(tag_path))
+                print(__line__(), f"tag_path += {current_tag.name} -> tag_path: " + format_tag_path(tag_path))
             in_start_tag = True
+            #print(__line__(), f"node {node_type_id} -> in_start_tag=True")
+            current_tag.open_space = node_source_space_before
+            current_tag.open = node_source
+            # dont write. wait for end of start tag
+            last_node_to = node.range.end_byte
+            continue
 
         # start of close tag
+        # "</"
         # elif node_type_name == "StartCloseTag":
-        elif node_type_id == 7: # node 7 </ 2 '</ ...'
+        # TODO sym__start_tag_name
+        elif node_type_id == node_kind["</"]: # node 7 </ 2 '</ ...'
+            if show_debug:
+                print(f"tag_path: " + format_tag_path(tag_path))
             if is_sentence_tag(current_tag):
 
                 if current_lang is None:
@@ -500,7 +760,10 @@ async def export_lang(input_path, target_lang):
 
                 text_to_translate_list.append(text_to_translate)
 
+                # htmlBetweenReplacementsList.push("");
                 html_between_replacements_list.append("")
+                if show_debug:
+                    print("html_between_replacements_list[-1]", __line__(), repr(html_between_replacements_list[-1]))
 
         # end of tag
         # or
@@ -519,15 +782,171 @@ async def export_lang(input_path, target_lang):
         # node 3 = >: ">"
         # node 6 = />: "/>"
 
-        elif node_type_id == 3 or node_type_id == 6:
-            if debug:
+        elif node_type_id == node_kind[">"] or node_type_id == node_kind["/>"]:
+
+            if show_debug:
                 print(f"node {node_type_id}: current_tag.name = {current_tag.name}")
                 print(f"node {node_type_id}: in_start_tag = {in_start_tag}")
                 print(f"node {node_type_id}: is_self_closing_tag = {is_self_closing_tag_name(current_tag.name)}")
-            if (in_start_tag == True and is_self_closing_tag_name(current_tag.name)) or in_start_tag == False:
+
+            if in_start_tag:
+                # end of start tag
+                if show_debug:
+                    print(f"node {node_type_id}: end of start tag -> in_start_tag=False")
+                # process and write the start tag
+
+                write_comment(json.dumps({
+                    "tag_path": format_tag_path(tag_path),
+                    "current_tag.name": current_tag.name,
+                    "current_tag.notranslate": current_tag.notranslate,
+                    "current_tag.attrs": list(map(lambda a: "".join(a), current_tag.attrs)),
+                }, indent=2))
+
+                # write " <some_name"
+                output_template_html.write(
+                    # " <"
+                    current_tag.open_space + current_tag.open +
+                    # "some_name"
+                    current_tag.name_space + current_tag.name +
+                    ""
+                )
+
+                #if current_tag.notranslate or current_tag.lang == target_lang:
+                if not should_translate_current_tag(current_tag, in_notranslate_block, current_lang, target_lang):
+                    # preserve attributes
+                    for attr_item in current_tag.attrs:
+                        output_template_html.write("".join(attr_item))
+
+                #if should_translate_current_tag(current_tag, in_notranslate_block, current_lang, target_lang):
+                else:
+                    # modify attributes
+                    for attr_item in current_tag.attrs:
+
+                        (
+                            attr_name_space,
+                            attr_name,
+                            attr_is_space,
+                            attr_is,
+                            attr_value_space,
+                            attr_value_quote,
+                            attr_value,
+                            attr_value_quote,
+                        ) = attr_item
+
+                        # modify attribute
+                        if attr_name == "lang":
+                            attr_value = target_lang
+
+                        # translate attribute value in some cases
+                        # <meta name="description" content="...">
+                        # <meta name="keywords" content="...">
+                        # <div title="...">...</div>
+                        # other <meta> tags are already guarded by <notranslate>
+                        if (
+                            (translate_title_attr and attr_name == "title")
+                            or
+                            (translate_meta_content and current_tag.name == 'meta' and attr_name == "content")
+                        ):
+                            # TODO later
+                            # TODO export_lang must decode html entities to utf8
+                            #attr_value_text = html.unescape(attr_value)
+                            # TODO import_lang must encode html entities from utf8
+                            #attr_value = html.escape(attr_value_text)
+
+                            attr_value_hash = sha1sum(attr_value.encode("utf8"))
+                            text_idx = len(text_to_translate_list)
+                            node_source_key = f"{text_idx}_{current_lang}_{attr_value_hash}"
+                            todo_remove_end_of_sentence = 0
+
+                            if not node_source_is_end_of_sentence(attr_value):
+                                attr_value += "."
+                                todo_remove_end_of_sentence = 1
+
+                            translation_key = f"{current_lang}:{target_lang}:{attr_value_hash}"
+
+                            todo_add_to_translations_database = 0 if translation_key in translations_database else 1
+
+                            if current_lang is None:
+                                source_start = node_source[:100]
+                                # TODO show "outerHTML". this is only the text node
+                                raise ValueError(f"node has no lang attribute: {repr(source_start)}")
+
+                            text_to_translate = [
+                                text_idx,
+                                attr_value_hash,
+                                current_lang,
+                                attr_value,
+                                todo_remove_end_of_sentence,
+                                todo_add_to_translations_database,
+                            ]
+
+                            text_to_translate_list.append(text_to_translate)
+
+                            # store outputHtml between the last replacement and this replacment
+                            output_template_html.seek(last_replacement_end)
+                            html_between_replacements_list.append("".join((
+                                output_template_html.read(),
+                                attr_name_space,
+                                attr_name,
+                                attr_is_space,
+                                attr_is,
+                                attr_value_space,
+                                attr_value_quote,
+                                #attr_value,
+                                #attr_value_quote,
+                            )))
+
+                            attr_value = f"{{TODO_translate_{node_source_key}}}"
+
+                            # store end position of attr_value
+                            last_replacement_end = output_template_html.tell() + len("".join((
+                                attr_name_space,
+                                attr_name,
+                                attr_is_space,
+                                attr_is,
+                                attr_value_space,
+                                attr_value_quote,
+                                attr_value,
+                                #attr_value_quote,
+                            )))
+
+                        # write attribute
+                        attr_item = (
+                            attr_name_space,
+                            attr_name,
+                            attr_is_space,
+                            attr_is,
+                            attr_value_space,
+                            attr_value_quote,
+                            attr_value,
+                            attr_value_quote,
+                        )
+                        output_template_html.write("".join(attr_item))
+
+                        if (
+                            attr_name == "lang" and
+                            current_tag.lang != target_lang and
+                            current_tag.ol is None
+                        ):
+                            # add "ol" attribute after "lang" attribute
+                            output_template_html.write(
+                                f' ol="{current_tag.lang}"'
+                            )
+
+            if (
+                # self-closing tag "<br>"
+                (in_start_tag == True and is_self_closing_tag_name(current_tag.name)) or
+                # close tag "</div>"
+                in_start_tag == False
+                #or
+                #in_doctype_node == True
+            ):
+                # end of close tag
+                if show_debug:
+                    print(f"node {node_type_id}: end of close tag")
                 closed_tag = tag_path.pop()
-                if debug:
-                    print(f"tag_path -= {closed_tag.name} -> tag_path: /" + "/".join(map(lambda t: t.name or "(noname)", tag_path)))
+                if show_debug:
+                    print(f"tag_path -= {closed_tag.name} -> tag_path: " + format_tag_path(tag_path))
                 try:
                     current_tag = tag_path[-1]
                 except IndexError:
@@ -538,20 +957,28 @@ async def export_lang(input_path, target_lang):
                         current_lang = tag_path[i].lang
                         break
                 #in_start_tag = False
+
+            #print(__line__(), f"node {node_type_id} -> in_start_tag=False")
             in_start_tag = False
 
-        # node 4 = doctype: 'DOCTYPE'
-        # node 17 = tag_name: "img"
-        elif node_type_id == 4 or node_type_id == 17:
-            if current_tag.name == None:
-                current_tag.name = node.text.decode("utf8")
-                if debug:
-                    print(f"current_tag.name = {current_tag.name} -> tag_path: /" + "/".join(map(lambda t: t.name or "(noname)", tag_path)))
+        # TagName in StartTag
+        # node 4 = doctype: 'DOCTYPE' # sym__doctype
+        # node 17 = tag_name: "img" # sym__start_tag_name
+        elif node_type_id == full_node_kind["sym__doctype"] or node_type_id == node_kind["sym__start_tag_name"]:
+            if current_tag.name is None:
+                current_tag.name_space = node_source_space_before
+                current_tag.name = node_source
+                if show_debug:
+                    print(f"current_tag.name = {current_tag.name} -> tag_path: " + format_tag_path(tag_path))
+            if in_start_tag:
+                # dont write. wait for end of start tag
+                last_node_to = node.range.end_byte
+                continue
 
         # AttributeName in StartTag
-        elif node_type_id == 9:
-            current_attr_name = node.text.decode("utf8")
-            current_attr_name_space = node_source_space_before
+        elif node_type_id == node_kind["attribute_name"]:
+            attr_name = node_source
+            attr_name_space = node_source_space_before
             # dont output the AttributeName node yet
             # wait for AttributeValue
             last_node_to = node.range.end_byte
@@ -560,9 +987,9 @@ async def export_lang(input_path, target_lang):
 
         # Is ("=") in StartTag
         #elif in_start_tag and node_type_name == "Is":
-        elif node_type_id == 8:
-            current_attr_is = node.text.decode("utf8")
-            current_attr_is_space = node_source_space_before
+        elif node_type_id == node_kind["="]:
+            attr_is = node_source
+            attr_is_space = node_source_space_before
             # dont output the Is node yet
             # wait for AttributeValue
             last_node_to = node.range.end_byte
@@ -571,8 +998,12 @@ async def export_lang(input_path, target_lang):
 
         #14, # double quote '"'
         #12, # single quote "'"
-        elif node_type_id == 14 or node_type_id == 12:
-            current_attr_value_quote = node.text.decode("utf8")
+        # elif node_type_id == 14 or node_type_id == 12:
+        #     #attr_value_quote = node_source
+        #     if attr_name:
+        #         attr_value_quote = node_source
+        #     last_node_to = node.range.end_byte
+        #     continue
 
         # FIXME handle boolean attributes
         # <details open>
@@ -585,145 +1016,90 @@ async def export_lang(input_path, target_lang):
         # node 10 = attribute_value: "asdf"
         # node 14 = ": "\""
         #elif node_type_id == 26:
-        elif node_type_id == 10:
+        #elif node_type_id == 10:
+        elif node_type_id in (
+            node_kind["doublequoted_attribute_value"],
+            node_kind["singlequoted_attribute_value"],
+            node_kind["unquoted_attribute_value"],
+        ):
             # lezer-parser-html
-            #quote = node.text.decode("utf8")[0]
-            #current_attr_value_quoted = node.text.decode("utf8")
-            #current_attr_value = node.text.decode("utf8")[1:-1]  # remove quotes
-            # tree-sitter-html
-            quote = current_attr_value_quote
-            current_attr_value_quote = None
-            current_attr_value_quoted = quote + node.text.decode("utf8") + quote
-            current_attr_value = node.text.decode("utf8")
-            current_tag.attrs.append([current_attr_name, current_attr_value_quoted])
+            # patched tree-sitter-html
+            # https://github.com/tree-sitter/tree-sitter-html/pull/90
 
-            if current_attr_name == "lang":
-                current_tag.lang = current_attr_value
-                current_lang = current_tag.lang
+            attr_value_space = node_source_space_before
 
-                if current_lang != target_lang:
-                    node_source_new = quote + target_lang + quote
-                    # modify the lang="..." attribute
-                    #output_template_html += (
-                    output_template_html.write(
-                        current_attr_name_space + current_attr_name +
-                        current_attr_is_space + current_attr_is +
-                        node_source_space_before + node_source_new
-                    )
-                    # stop processing this AttributeValue
-                    last_node_to = node.range.end_byte
-                    #return
-                    continue
+            if node_type_id == node_kind["unquoted_attribute_value"]:
+                attr_value_quote = ""
+                attr_value = node_source
+                #attr_value_quoted = attr_value
+
+            else:
+                #quote = attr_value_quote
+                #attr_value_quote = None
+                attr_value_quote = node_source[0]
+                #attr_value = node_source
+                attr_value = node_source[1:-1]  # remove quotes
+                #attr_value_quoted = quote + node_source + quote
+                #attr_value_quoted = node_source
+
+            # buffer all attributes, wait for end of start tag
+            # class="notranslate" can come after lang="en"
+            attr_item = (
+                attr_name_space,
+                attr_name,
+                attr_is_space,
+                attr_is,
+                attr_value_space,
+                attr_value_quote,
+                attr_value,
+                attr_value_quote,
+            )
+            #print(__line__(), "attr_item", "".join(attr_item))
+            current_tag.attrs.append(attr_item)
+
+            if attr_name == "lang":
+                current_tag.lang = attr_value
+                current_lang = attr_value
+                # no. wrong!
+                # TODO move
+                # if current_tag.lang == target_lang:
+                #     current_tag.notranslate = True
+
+            # ol = original language
+            elif attr_name == "ol":
+                current_tag.ol = attr_value
 
             # ignore tags with attribute: class="notranslate"
-            elif current_attr_name == "class":
-                #class_list = set(current_attr_value.split())
-                class_list = current_attr_value.split()
+            elif attr_name == "class":
+                #class_list = set(attr_value.split())
+                class_list = attr_value.split()
+                current_tag.class_list += class_list
                 if "notranslate" in class_list:
                     current_tag.notranslate = True
-                    #output_template_html += (
-                    output_template_html.write(
-                        current_attr_name_space + current_attr_name +
-                        current_attr_is_space + current_attr_is +
-                        node_source_space_before + node.text.decode("utf8")
-                    )
-                    last_node_to = node.range.end_byte
-                    #return
-                    continue
 
             # ignore tags with attribute: src-lang-id="..."
-            elif current_attr_name == "src-lang-id":
-                if current_attr_value.startswith(target_lang + ":"):
-                    current_tag.has_translation = True
-                    #output_template_html += (
-                    output_template_html.write(
-                        current_attr_name_space + current_attr_name +
-                        current_attr_is_space + current_attr_is +
-                        node_source_space_before + node.text.decode("utf8")
-                    )
-                    last_node_to = node.range.end_byte
-                    #return
-                    continue
+            elif attr_name == "src-lang-id":
+                if attr_value.startswith(target_lang + ":"):
+                    #current_tag.has_translation = True
+                    current_tag.notranslate = True
 
             # ignore tags with attribute: style="display:none"
             # TODO also ignore all child nodes of such tags
-            elif current_attr_name == "style":
+            elif attr_name == "style":
                 # TODO parse CSS. this can be something stupid like
                 # style="/*display:none*/"
-                # TODO regex
-                # currentAttrValue.match(/.*\b(display\s*:\s*none)\b.*/s) != null
-                if current_attr_value == "display:none" or "display: none" in current_attr_value:
+                if re.search(r"\b(display\s*:\s*none)\b", attr_value) != None:
                     current_tag.notranslate = True
-                    # stop processing this AttributeValue
-                    #output_template_html += (
-                    output_template_html.write(
-                        current_attr_name_space + current_attr_name +
-                        current_attr_is_space + current_attr_is +
-                        node_source_space_before + node.text.decode("utf8")
-                    )
-                    last_node_to = node.range.end_byte
-                    continue
-                    return
 
-            # clear the output buffer
-            #output_template_html += (
-            output_template_html.write(
-                current_attr_name_space + current_attr_name +
-                current_attr_is_space + current_attr_is
-            )
+            #print("attr_name", __line__(), repr(attr_name))
 
-            # translate the AttributeValue in some cases
-            # <meta name="description" content="...">
-            # <meta name="keywords" content="...">
-            # <div title="...">...</div>
-            # other <meta> tags are already guarded by <notranslate>
-            if should_translate_current_tag(current_tag, do_translate, current_lang, target_lang):
-                if (translate_title_attr and current_attr_name == "title") or \
-                        (translate_meta_content and current_tag.name == 'meta' and current_attr_name == "content"):
-                    node_source_trimmed = node.text.decode("utf8")[1:-1]  # remove quotes
-                    node_source_trimmed_hash = sha1sum(node_source_trimmed.encode("utf8"))
-                    text_idx = len(text_to_translate_list)
-                    node_source_key = f"{text_idx}_{current_lang}_{node_source_trimmed_hash}"
-                    todo_remove_end_of_sentence = 0
+            attr_name = None
 
-                    if not node_source_is_end_of_sentence(node_source_trimmed) and is_sentence_tag(current_tag):
-                        node_source_trimmed += "."
-                        todo_remove_end_of_sentence = 1
+            # dont write. wait for end of start tag
+            last_node_to = node.range.end_byte
+            continue
 
-                    translation_key = f"{current_lang}:{target_lang}:{node_source_trimmed_hash}"
-
-                    todo_add_to_translations_database = 1 if translation_key not in translations_database else 0
-
-                    if current_lang is None:
-                        source_start = node_source[:100]
-                        # TODO show "outerHTML". this is only the text node
-                        raise ValueError(f"node has no lang attribute: {repr(source_start)}")
-
-                    text_to_translate = [
-                        text_idx,
-                        node_source_trimmed_hash,
-                        current_lang,
-                        node_source_trimmed,
-                        todo_remove_end_of_sentence,
-                        todo_add_to_translations_database,
-                    ]
-
-                    text_to_translate_list.append(text_to_translate)
-
-                    # store outputHtml between the last replacement and this replacment
-                    output_template_html.seek(last_replacement_end)
-                    html_between_replacements_list.append(
-                        #output_template_html[last_replacement_end:] + quote
-                        output_template_html.read() + quote
-                    )
-                    #output_template_html += (
-                    output_template_html.write(
-                        f"{quote}{{TODO_translate_{node_source_key}}}{quote}"
-                    )
-                    last_replacement_end = output_template_html.tell() - 1
-                    last_node_to = node.range.end_byte
-                    continue
-                    return
+        # end of: elif node_type_id == 10
 
         # TODO? filter EntityReference in AttributeValue
         # for now, this is only needed for lezer-parser-html
@@ -748,18 +1124,27 @@ async def export_lang(input_path, target_lang):
         # nodeTypeId == 17 || // EntityReference // "&amp;" or "&mdash;" or ...
         # nodeTypeId == 28 || // ScriptText
         # nodeTypeId == 31 || // StyleText
-        if node_type_id == 16:
+        if node_type_id == node_kind["text"]:
             if (node_source_space_before + node_source).strip() == "":
                 #output_template_html += (
                 output_template_html.write(
                     node_source_space_before + node_source
                 )
+                if show_debug:
+                    print("output_template_html.write", __line__(), repr(
+                        node_source_space_before + node_source
+                    ))
                 last_node_to = node.range.end_byte
                 continue
                 return
 
-            if should_translate_current_tag(current_tag, do_translate, current_lang, target_lang):
-                node_source_trimmed = node_source.strip()
+            if should_translate_current_tag(current_tag, in_notranslate_block, current_lang, target_lang):
+            #if current_tag.notranslate == False and current_tag.lang != target_lang:
+                # TODO also compare source and target language
+                # if they are equal, no need to translate
+                # let nodeSourceTrimmed = nodeSource;
+                #node_source_trimmed = node_source.strip()
+                node_source_trimmed = node_source
                 node_source_trimmed_hash = sha1sum(node_source_trimmed.encode("utf8"))
                 text_idx = len(text_to_translate_list)
                 node_source_key = f"{text_idx}_{current_lang}_{node_source_trimmed_hash}"
@@ -796,11 +1181,17 @@ async def export_lang(input_path, target_lang):
                     #output_template_html[last_replacement_end:] + node_source_space_before
                     output_template_html.read() + node_source_space_before
                 )
+                if show_debug:
+                    print("html_between_replacements_list[-1]", __line__(), repr(html_between_replacements_list[-1]))
 
                 #output_template_html += (
                 output_template_html.write(
                     node_source_space_before + "{TODO_translate_" + node_source_key + "}"
                 )
+                if show_debug:
+                    print("output_template_html.write", __line__(), repr(
+                        node_source_space_before + "{TODO_translate_" + node_source_key + "}"
+                    ))
                 last_replacement_end = output_template_html.tell()
                 last_node_to = node.range.end_byte
                 continue
@@ -808,15 +1199,19 @@ async def export_lang(input_path, target_lang):
 
         # node 24 = comment
         # if (nodeTypeId == 39) { // Comment
-        elif node_type_id == 24:
+        elif node_type_id == node_kind["comment"]:
             if (
                 not translate_comments or
-                not should_translate_current_tag(current_tag, do_translate, current_lang, target_lang)
+                not should_translate_current_tag(current_tag, in_notranslate_block, current_lang, target_lang)
             ):
                 #output_template_html += (
                 output_template_html.write(
                     node_source_space_before + node_source
                 )
+                if show_debug:
+                    print("output_template_html.write", __line__(), repr(
+                        node_source_space_before + node_source
+                    ))
                 last_node_to = node.range.end_byte
                 continue
                 return
@@ -832,14 +1227,20 @@ async def export_lang(input_path, target_lang):
                 output_template_html.write(
                     node_source_space_before + node_source
                 )
+                if show_debug:
+                    print("output_template_html.write", __line__(), repr(
+                        node_source_space_before + node_source
+                    ))
                 last_node_to = node.range.end_byte
                 continue
                 return
 
-            if should_translate_current_tag(current_tag, do_translate, current_lang, target_lang):
+            if should_translate_current_tag(current_tag, in_notranslate_block, current_lang, target_lang):
                 # TODO also compare source and target language
                 # if they are equal, no need to translate
-                node_source_trimmed = comment_content.strip()
+                # let nodeSourceTrimmed = commentContent;
+                #node_source_trimmed = comment_content.strip()
+                node_source_trimmed = comment_content
                 node_source_trimmed_hash = sha1sum(node_source_trimmed.encode("utf8"))
                 text_idx = len(text_to_translate_list)
                 node_source_key = f"{text_idx}_{comment_lang or current_lang}_{node_source_trimmed_hash}"
@@ -877,23 +1278,34 @@ async def export_lang(input_path, target_lang):
                     #output_template_html[last_replacement_end:] + node_source_space_before
                     output_template_html.read() + node_source_space_before
                 )
+                if show_debug:
+                    print("html_between_replacements_list[-1]", __line__(), repr(html_between_replacements_list[-1]))
 
                 # TODO store context of replacement: attribute value with quotes (single or double quotes?)
                 # then escape the quotes in the translated text
                 #output_template_html += (
                 output_template_html.write(
-                    f"{node_source_space_before}<!--{{TODO_translate_{node_source_key}}}"
+                    f"{node_source_space_before}<!--{{TODO_translate_{node_source_key}}}-->"
                 )
+                if show_debug:
+                    print("output_template_html.write", __line__(), repr(
+                        f"{node_source_space_before}<!--{{TODO_translate_{node_source_key}}}-->"
+                    ))
                 last_replacement_end = output_template_html.tell() - 3
                 last_node_to = node.range.end_byte
                 continue
-                return
 
         # default: copy this node
+        if show_debug:
+            print("node", __line__(), node.kind_id, node_name[node.kind_id], node)
         #output_template_html += (
         output_template_html.write(
             node_source_space_before + node_source
         )
+        if show_debug:
+            print("output_template_html.write", __line__(), repr(
+                node_source_space_before + node_source
+            ))
         last_node_to = node.range.end_byte
         continue
         return
@@ -908,7 +1320,7 @@ async def export_lang(input_path, target_lang):
             'hint: check if all the tags opened ' +
             'at line 1 were closed.'
         ))
-        print("tag_path: /" + "/".join(map(lambda t: t.name or "(noname)", tag_path)))
+        print("tag_path: " + format_tag_path(tag_path))
         sys.exit(1)
 
     # html after the last replacement
@@ -917,20 +1329,22 @@ async def export_lang(input_path, target_lang):
         #output_template_html[last_replacement_end:]
         output_template_html.read()
     )
+    if show_debug:
+        print("html_between_replacements_list[-1]", __line__(), repr(html_between_replacements_list[-1]))
 
     # const outputTemplateHtmlPath = inputPath + '.' + inputHtmlHash + '.outputTemplate.html';
-    output_template_html_path = input_path + '.' + input_html_hash + '.outputTemplate.html'
+    output_template_html_path = output_dir + input_path + '.' + input_html_hash + '.outputTemplate.html'
     print(f"writing {output_template_html_path}")
     output_template_html = output_template_html.getvalue()
     with open(output_template_html_path, 'w') as f:
         f.write(output_template_html)
 
-    text_to_translate_list_path = input_path + '.' + input_html_hash + '.textToTranslateList.json'
+    text_to_translate_list_path = output_dir + input_path + '.' + input_html_hash + '.textToTranslateList.json'
     print(f"writing {text_to_translate_list_path}")
     with open(text_to_translate_list_path, 'w') as f:
         json.dump(text_to_translate_list, f, indent=2)
 
-    html_between_replacements_path = input_path + '.' + input_html_hash + '.htmlBetweenReplacementsList.json'
+    html_between_replacements_path = output_dir + input_path + '.' + input_html_hash + '.htmlBetweenReplacementsList.json'
     print(f"writing {html_between_replacements_path}")
     with open(html_between_replacements_path, 'w') as f:
         json.dump(html_between_replacements_list, f, indent=2)
@@ -1097,6 +1511,8 @@ async def export_lang(input_path, target_lang):
         # also because we send lines to the translator, to get the "splitted" translation
         # so we need a way to encode text blocks
 
+        #print("text_to_translate[3]", repr(text_to_translate[3]))
+
         # TODO? add source language sl="..."
         text_to_translate_html = f'<html i="{text_to_translate[0]}" h="{text_to_translate[1]}" rme="{text_to_translate[4]}" add="{text_to_translate[5]}">\n{text_to_translate[3]}\n</html>'
 
@@ -1133,6 +1549,8 @@ async def export_lang(input_path, target_lang):
             re.S | re.U
         )
 
+        #print("text_to_translate_html", repr(text_to_translate_html))
+
         # encode html
         # replace html tags with "symbols in square braces"
         # consume all whitespace around the source text
@@ -1148,6 +1566,7 @@ async def export_lang(input_path, target_lang):
             text_before_match = (
                 text_to_translate_html[last_match_end:match.start()]
             )
+            #print("text_before_match", __line__(), repr(text_before_match)) # debug
             if text_before_match != "":
                 # is_replacement = 0
                 text_part_raw_list.append(
@@ -1157,6 +1576,7 @@ async def export_lang(input_path, target_lang):
             # see also: get_replace
             replacement_id = replacement_data_lastId_2 + 1
             # is_replacement = 1
+            #print("match", __line__(), repr(match.group())) # debug
             text_part_raw_list.append(
                 [match.group(), 1, replacement_id]
             )
@@ -1186,7 +1606,7 @@ async def export_lang(input_path, target_lang):
     # loop text_to_translate_list done
 
     # const replacementDataPath = inputPath + '.' + inputHtmlHash + '.replacementData.json';
-    replacement_data_path = f'{input_path}.{input_html_hash}.replacementData.json'
+    replacement_data_path = output_dir + f'{input_path}.{input_html_hash}.replacementData.json'
     print(f"writing {replacement_data_path}")
     with open(replacement_data_path, 'w', encoding='utf-8') as f:
         json.dump(replacement_data, f, indent=2)
@@ -1357,9 +1777,7 @@ async def export_lang(input_path, target_lang):
                             raise NotImplementedError("TODO keep this branch")
 
                         # remove text-parts from last group
-                        # TODO verify
-                        # textGroupsRaw[textGroupsRaw.length - 2] = textGroupsRaw[textGroupsRaw.length - 2].slice(0, lastGroupEndGroupIdx + 1);
-                        last_group_raw = last_group_raw[:last_group_end_group_idx + 1]
+                        text_groups_raw[-2] = text_groups_raw[-2][:last_group_end_group_idx + 1]
 
                         # stats
                         last_group_size_after = len(stringify_raw_text_group(last_group_raw))
@@ -1438,7 +1856,7 @@ async def export_lang(input_path, target_lang):
 
     # Write to textPartsByLang.json
     # const textPartsByLangPath = inputPath + '.' + inputHtmlHash + '.textPartsByLang.json';
-    text_parts_by_lang_path = f"{input_path}.{input_html_hash}.textPartsByLang.json"
+    text_parts_by_lang_path = output_dir + f"{input_path}.{input_html_hash}.textPartsByLang.json"
     print(f"Writing {text_parts_by_lang_path}")
     with open(text_parts_by_lang_path, "w") as file:
         json.dump(text_parts_by_lang, file, indent=2)
@@ -1450,13 +1868,13 @@ async def export_lang(input_path, target_lang):
     # so we dont send them to the translator again
 
     # Write to textGroupsByLang.json
-    text_groups_path = f"{input_path}.{input_html_hash}.textGroupsByLang.json"
+    text_groups_path = output_dir + f"{input_path}.{input_html_hash}.textGroupsByLang.json"
     print(f"Writing {text_groups_path}")
     with open(text_groups_path, "w") as file:
         json.dump(text_groups_by_lang, file, indent=2)
 
     # Write to textGroupsRawByLang.json
-    text_groups_raw_by_lang_path = f"{input_path}.{input_html_hash}.textGroupsRawByLang.json"
+    text_groups_raw_by_lang_path = output_dir + f"{input_path}.{input_html_hash}.textGroupsRawByLang.json"
     print(f"Writing {text_groups_raw_by_lang_path}")
     with open(text_groups_raw_by_lang_path, "w") as file:
         json.dump(text_groups_raw_by_source_lang, file, indent=2)
@@ -1544,7 +1962,7 @@ async def export_lang(input_path, target_lang):
         '<div id="groups">\n' + ''.join(translate_links) + '</div>\n'
     )
 
-    translate_links_path = f"{input_path}.{input_html_hash}.translate-{target_lang}.html"
+    translate_links_path = output_dir + f"{input_path}.{input_html_hash}.translate-{target_lang}.html"
     print(f"writing {translate_links_path}")
     with open(translate_links_path, 'w', encoding='utf-8') as file:
         file.write(html_src)
@@ -1555,12 +1973,12 @@ async def export_lang(input_path, target_lang):
 
 
 
-async def import_lang(input_path, target_lang, translations_path_list):
+async def import_lang(input_path, target_lang, translations_path_list, output_dir=""):
     print(f"reading {input_path}")
     with open(input_path, 'r') as file:
         input_html_bytes = file.read()
     input_html_hash = 'sha1-' + hashlib.sha1(input_html_bytes.encode('utf-8')).hexdigest()
-    input_path_frozen = input_path + '.' + input_html_hash
+    input_path_frozen = output_dir + input_path + '.' + input_html_hash
     output_template_html_path = input_path_frozen + '.outputTemplate.html'
     text_to_translate_list_path = input_path_frozen + '.textToTranslateList.json'
     replacement_data_path = input_path_frozen + '.replacementData.json'
@@ -1570,7 +1988,7 @@ async def import_lang(input_path, target_lang, translations_path_list):
     text_parts_by_lang_path = input_path_frozen + '.textPartsByLang.json'
     translated_html_path = input_path_frozen + '.translated.html'
     translated_splitted_html_path = input_path_frozen + '.translated.splitted.html'
-    translations_database_html_path_glob = 'translations-google-database-*-*.html'
+    translations_database_html_path_glob = output_dir + 'translations-google-database-*-*.html'
     translations_database = {}
 
     for translations_database_html_path in glob.glob(translations_database_html_path_glob):
@@ -1783,6 +2201,10 @@ async def main():
 
     translations_path_list = argv[2:]
 
+    # TODO implement. use argparse
+    #output_dir = (os.path.abspath(argv[2]) + "/") if len(argv) > 2 else ""
+    output_dir = ""
+
     if not input_path or not target_lang:
         print("error: missing arguments", file=sys.stderr)
         print("usage:", file=sys.stderr)
@@ -1793,9 +2215,9 @@ async def main():
         return 1
 
     if translations_path_list:
-        return await import_lang(input_path, target_lang, translations_path_list)
+        return await import_lang(input_path, target_lang, translations_path_list, output_dir)
     else:
-        return await export_lang(input_path, target_lang)
+        return await export_lang(input_path, target_lang, output_dir)
 
 
 

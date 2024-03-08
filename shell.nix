@@ -4,6 +4,20 @@
 
 let
 
+  tree-sitter-html-src = pkgs.fetchFromGitHub {
+    repo = "tree-sitter-html";
+    /*
+    owner = "tree-sitter";
+    # https://github.com/tree-sitter/tree-sitter-html/pull/89
+    rev = "8801a68dacfd4a2f6e6c3b7c9adab551a06b267c";
+    hash = "sha256-7VYLkr0CnPvWAac/sg7dXw6FuOZ6Xwof2GqRuDu3NuM=";
+    */
+    owner = "milahu";
+    # https://github.com/milahu/tree-sitter-html/tree/pulls-89-and-90
+    rev = "dffe3c09470a695819c0cce58b2acbbb6f83fcd9";
+    hash = "sha256-VK2dirxYhImlvopz/s2BCZMQHW6C7xP6XGCOrazNvPQ=";
+  };
+
   extraPythonPackages = rec {
 
     cdp-socket = pkgs.python3.pkgs.callPackage ./nix/cdp-socket.nix {};
@@ -18,8 +32,15 @@ let
     # https://github.com/milahu/nixpkgs/issues/20
     selenium = pkgs.python3.pkgs.callPackage ./nix/selenium.nix { };
 
-    tree-sitter-languages = pkgs.python3.pkgs.callPackage ./nix/tree-sitter-languages/tree-sitter-languages.nix { };
-
+    tree-sitter-languages = pkgs.python3.pkgs.callPackage ./nix/tree-sitter-languages/tree-sitter-languages.nix {
+      tree-sitter-grammars = pkgs.tree-sitter-grammars // {
+        # https://github.com/tree-sitter/tree-sitter-html/pull/89
+        # add leading and trailing whitespace to text nodes
+        tree-sitter-html = pkgs.tree-sitter-grammars.tree-sitter-html.overrideAttrs (oldAttrs: {
+          src = tree-sitter-html-src;
+        });
+      };
+    };
   };
 
   python = pkgs.python3.withPackages (pythonPackages:
@@ -78,6 +99,8 @@ let
 in
 
 pkgs.mkShell rec {
+
+  TREE_SITTER_HTML_SRC = tree-sitter-html-src;
 
   buildInputs = (with pkgs; [
   ]) ++ [
