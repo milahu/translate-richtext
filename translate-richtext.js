@@ -1878,7 +1878,9 @@ const inputHtml = `
         const textBeforeMatch = (
           textToTranslateHtml.slice(lastMatchEnd, matchPos)
         );
-        console.log(`textBeforeMatch`, JSON.stringify(textBeforeMatch)); // debug
+        if (debugAlignment) {
+          console.log(`textBeforeMatch`, JSON.stringify(textBeforeMatch));
+        }
         if (textBeforeMatch != "") {
           textPartRawList.push([
             textBeforeMatch,
@@ -1887,7 +1889,9 @@ const inputHtml = `
         }
         // see also: getReplace
         const replacementId = replacementData_lastId_2 + 1;
-        console.log(`match`, JSON.stringify(match)); // debug
+        if (debugAlignment) {
+          console.log(`match`, JSON.stringify(match));
+        }
         textPartRawList.push([
           match,
           1, // isReplacement
@@ -2536,10 +2540,11 @@ const inputHtml = `
           htmlEntities.encode(textGroup.slice(0, previewTextLength/2)) + ' ... ' +
           htmlEntities.encode(textGroup.slice(-previewTextLength/2))
         ).replace(/\n/sg, " ");
-        const linkId = (
-          (exportFn == joinText) ? `${textGroupRawIdx}-joined` :
-          (exportFn == splitText) ? `${textGroupRawIdx}-splitted` :
-          `${textGroupRawIdx}`
+        // see also translationsBaseNameMatch
+        const linkId = `translation-${sourceLang}-${targetLang}-${textGroupRawIdx.toString().padStart(4, '0')}` + (
+          (exportFn == joinText) ? "-joined" :
+          (exportFn == splitText) ? "-splitted" :
+          ""
         );
         translateLinks.push(`<div id="group-${linkId}">group ${linkId}: <a target="_blank" href="${translateUrl}">${sourceLang}:${targetLang}: ${previewText}</a></div>\n`);
       }
@@ -2713,8 +2718,8 @@ async function importLang(inputPath, targetLang, translationsPathList) {
   const htmlBetweenReplacementsPath = inputPathFrozen + '.htmlBetweenReplacementsList.json';
   const textPartsByLangPath = inputPathFrozen + '.textPartsByLang.json';
 
-  const translatedHtmlPath = inputPathFrozen + '.translated.html';
-  const translatedSplittedHtmlPath = inputPathFrozen + '.translated.splitted.html';
+  const translatedHtmlPath = inputPathFrozen + `.translated-${targetLang}.html`;
+  const translatedSplittedHtmlPath = inputPathFrozen + `.translated-${targetLang}.splitted.html`;
 
   //const translatedTextPath = inputPathFrozen + '.translated.txt';
 
@@ -2829,7 +2834,7 @@ async function importLang(inputPath, targetLang, translationsPathList) {
 
     // debug
     // FIXME translatedTextLineCombinedJoinedSplitted == undefined
-    if (debugAlignment && translatedFileId >= 84) {
+    if (false && debugAlignment && translatedFileId >= 84) {
       console.log(`translatedFileId ${translatedFileId}`);
       console.log(`joinedTranslationsPath ${joinedTranslationsPath}`);
       console.log(`splittedTranslationsPath ${splittedTranslationsPath}`);
@@ -2850,9 +2855,9 @@ async function importLang(inputPath, targetLang, translationsPathList) {
       throw new Error("joinedTranslationsBasePath != splittedTranslationsBasePath");
     }
 
-    // example: de-en-000
+    // example: xxx.translation-de-en-0001
     const translationsBaseName = path.basename(translationsBasePath);
-    const translationsBaseNameMatch = translationsBaseName.match(/^([a-zA-Z_]+)-([a-zA-Z_]+)-([0-9]+)$/);
+    const translationsBaseNameMatch = translationsBaseName.match(/\.translation-([a-z_]+)-([a-z_]+)-([0-9]{4})$/);
     if (translationsBaseNameMatch == null) {
       throw new Error(`failed to parse translationsBaseName: ${translationsBaseName}`);
     }
@@ -2863,19 +2868,11 @@ async function importLang(inputPath, targetLang, translationsPathList) {
     // TODO rename textGroupRawList to textPartNodeList
     const textGroupRawList = textGroupsRawBySourceLang[sourceLang][translationFileIdx];
 
-    // TODO remove, instead use textGroupRawParsedList
-    const textGroupRawTextList = (
-      textGroupRawList
-      .map((node, nodeIdx) => [node, nodeIdx])
-      .filter(([node, _nodeIdx]) => node[1] == 0)
-      .map(([node, nodeIdx]) => [node[0], nodeIdx])
-    );
-
     // moved up
     //const textGroupRawParsedList = [];
     //let textBlockIdx = -1;
 
-
+    const debugTextGroupRawParser = false;
 
     // add values to textGroupRawParsed.textBlockTextPartList
     // parse text groups = source text blocks
@@ -2883,6 +2880,9 @@ async function importLang(inputPath, targetLang, translationsPathList) {
     // TODO rename textGroupRaw to textPartNode
     for (const textGroupRaw of textGroupRawList) {
       //console.dir({ textBlockIdx, textGroupRaw });
+      if (debugTextGroupRawParser) {
+        console.dir({ L: 2900, textGroupRaw });
+      }
       if (textGroupRaw[1] == 1) {
         // replacement: <html> or </html> or whitespace (or other html code?)
         if (textGroupRaw[0].startsWith('<html ')) {
@@ -2958,6 +2958,9 @@ async function importLang(inputPath, targetLang, translationsPathList) {
           // TODO handle todoRemoveEndOfSentence == 1 (here?)
           // 8 == "\n</html>".length
           const whitespaceAfterLastTextPart = textGroupRaw[0].slice(0, -8);
+          if (debugTextGroupRawParser) {
+            console.dir({ L: 2980, textGroupRaw, whitespaceAfterLastTextPart })
+          }
           textGroupRawParsed.textBlockTextPartList.push(whitespaceAfterLastTextPart);
           textGroupRawParsed.textBlockTextPartIsTextList.push(false);
           // TODO later: add whitespace to translations
@@ -2969,11 +2972,18 @@ async function importLang(inputPath, targetLang, translationsPathList) {
           */
           if (textGroupRawParsed.todoRemoveEndOfSentence == 1) {
             const textBlockTextPartList = textGroupRawParsed.textBlockTextPartList;
-            const idx = textBlockTextPartList.length - 1;
+            let idx = textBlockTextPartList.length - 1;
+            if (whitespaceAfterLastTextPart == "") {
+              // "." is in previous text part. TODO why? this was working before...
+              idx = idx - 1;
+            }
+            if (debugAlignment) {
+              console.log(`3000 textBlockTextPartList[idx] ${JSON.stringify(textBlockTextPartList[idx])}`)
+            }
             const end = textBlockTextPartList[idx].slice(-1);
             if (end != ".") {
-              console.dir({ textGroupRaw, textGroupRawParsed });
-              throw new Error(`unexpected end: ${end}`);
+              console.dir({ L: 2990, textGroupRaw, textBlockTextPartList_idx: textBlockTextPartList[idx] });
+              throw new Error(`unexpected end: ${JSON.stringify(end)}`);
             }
             // remove last char
             textBlockTextPartList[idx] = textBlockTextPartList[idx].slice(0, -1);
@@ -3006,7 +3016,8 @@ async function importLang(inputPath, targetLang, translationsPathList) {
         textGroupRawParsed.textBlockTextPartList.push(textGroupRaw[0]);
         textGroupRawParsed.textBlockTextPartIsTextList.push(true);
       }
-    } // add values to textGroupRawParsed.textBlockTextPartList
+    }
+    // done: add values to textGroupRawParsed.textBlockTextPartList
 
     //console.log(`reading ${joinedTranslationsPath}`);
     const joinedTranslationsTextRaw = fs.readFileSync(joinedTranslationsPath, 'utf8');
@@ -3016,6 +3027,7 @@ async function importLang(inputPath, targetLang, translationsPathList) {
 
     //let splittedTranslationsText = fs.readFileSync(translationsPathList, 'utf8');
 
+    // cleanup translation text
     function cleanupTranslation(text) {
       // TODO keep the original translations somewhere
       // currently, they are stored in translations-google-store/
@@ -3025,7 +3037,7 @@ async function importLang(inputPath, targetLang, translationsPathList) {
         .replace(new RegExp(`[${removeRegexCharClass}]`, 'g'), '')
         // fix double quotes
         // https://www.fileformat.info/info/unicode/char/0022/index.htm
-        .replace(/[\u201c\u201d\u2033\u02dd\u030b\u030e\u05f4\u3003]/g, '"')
+        .replace(/[\u201c\u201d\u201e\u2033\u02dd\u030b\u030e\u05f4\u3003]/g, '"')
         // fix single quotes
         // https://www.fileformat.info/info/unicode/char/0027/index.htm
         .replace(/[\u2018\u2019\u02b9\u02bc\u02c8\u0301\u030d\u05f3\u2032]/g, "'")
@@ -3077,17 +3089,7 @@ async function importLang(inputPath, targetLang, translationsPathList) {
           throw new Error(`command ${args[0]} failed with status ${proc.status}`);
         }
       }
-      if (!options.allowError) {
-        if (proc.error) {
-          console.dir({ proc, args, argsJoined: args.join(" ") }); // debug
-          throw new Error(`command ${args[0]} failed with error ${proc.error}`);
-        }
-      }
       return proc;
-      // proc.stdout
-      // proc.stderr
-      // proc.status
-      // proc.error
     }
 
     const systemUserId = execProcess(["id", "-u"]).stdout.trim();
@@ -3203,13 +3205,6 @@ async function importLang(inputPath, targetLang, translationsPathList) {
     const combinedJoinedSplittedTranslationsList = combinedJoinedSplittedTranslationsText.trim().split("\n");
     //const combinedSplittedJoinedTranslationsList = combinedSplittedJoinedTranslationsText.trim().split("\n");
 
-    false &&
-    console.dir({
-      textGroupRawTextList_start: textGroupRawTextList.slice(0, 5),
-      textGroupRawParsedList_start: textGroupRawParsedList.slice(0, 5),
-      splittedTranslationsList_start: splittedTranslationsList.slice(0, 5),
-    });
-
     let lastSplittedTranslationIdx = -1;
 
     // TODO are these "lines" or "blocks"?
@@ -3223,15 +3218,32 @@ async function importLang(inputPath, targetLang, translationsPathList) {
 
     let textBlockTextPartIdx;
 
+    if (debugTextGroupRawParser) {
+      console.log(`line 3250: textGroupRawParsedIdxLast ${textGroupRawParsedIdxLast}`)
+    }
+
     // loop text parts: add aligned translations to textGroupRawParsedList
     for (textGroupRawParsedIdx = textGroupRawParsedIdxLast; textGroupRawParsedIdx < textGroupRawParsedList.length; textGroupRawParsedIdx++) {
 
+      if (debugTextGroupRawParser) {
+        console.log(`line 3250: textGroupRawParsedIdx ${textGroupRawParsedIdx}`)
+      }
+
+      // TODO opposite?
       if (textGroupRawParsedIsFirst) {
-        textBlockTextPartIdxNext = textBlockTextPartIdxNextLast; // continue
+        // continue
+        if (debugAlignment) {
+          console.log(`line 3260: textBlockTextPartIdxNext ${textBlockTextPartIdxNext} -> ${textBlockTextPartIdxNextLast}`);
+        }
+        textBlockTextPartIdxNext = textBlockTextPartIdxNextLast;
         textGroupRawParsedIsFirst = false;
       }
       else {
-        textBlockTextPartIdxNext = 0; // reset
+        // reset
+        if (debugAlignment) {
+          console.log(`line 3260: textBlockTextPartIdxNext ${textBlockTextPartIdxNext} -> 0`);
+        }
+        textBlockTextPartIdxNext = 0;
       }
 
       debugAlignment &&
@@ -3250,15 +3262,24 @@ async function importLang(inputPath, targetLang, translationsPathList) {
 
       let stopLoopSourceTextPartsLoop = false;
 
-      debugAlignment &&
-      console.log(`line 3030: textBlockTextPartIdxNext ${textBlockTextPartIdxNext}`);
+      // parent loop
+      if (debugAlignment) {
+        console.log(`line 3030: translatedFileId ${translatedFileId}`)
+      }
 
-      // loop text parts of this text block
+      if (debugAlignment) {
+        console.log(`line 3030: looping textBlockTextPartIdx from ${textBlockTextPartIdxNext} to ${textBlockTextPartList.length - 1}`)
+      }
+
+      debugAlignment &&
+      console.log(`loop from next ...`);
+
+      // loop text parts of this text block from next
       for (textBlockTextPartIdx = textBlockTextPartIdxNext; textBlockTextPartIdx < textBlockTextPartList.length; textBlockTextPartIdx++) {
 
         //console.log(`    loop text parts of this text block: textBlockTextPartIdx ${textBlockTextPartIdx}`);
         debugAlignment &&
-        console.log(`translatedFileId ${String(translatedFileId).padStart(5)}   textGroupRawParsedIdx ${String(textGroupRawParsedIdx).padStart(5)}   textBlockTextPartIdx ${String(textBlockTextPartIdx).padStart(5)}`);
+        console.log(`loop from next: translatedFileId ${String(translatedFileId).padStart(5)}   textGroupRawParsedIdx ${String(textGroupRawParsedIdx).padStart(5)}   textBlockTextPartIdx ${String(textBlockTextPartIdx).padStart(5)}`);
 
         const textBlockTextPart = textBlockTextPartList[textBlockTextPartIdx];
         const textBlockTextPartIsText = textBlockTextPartIsTextList[textBlockTextPartIdx];
@@ -3270,6 +3291,7 @@ async function importLang(inputPath, targetLang, translationsPathList) {
           textGroupRawParsed.translations.splittedTranslationLineList[textBlockTextPartIdx] = translatedTextLineSplitted;
           textGroupRawParsed.translations.joinedTranslationLineList[textBlockTextPartIdx] = translatedTextLineCombinedJoinedSplitted;
           */
+          // read from text group raw parsed translations
           for (const translationLineList of Object.values(textGroupRawParsed.translations)) {
             //translationLineList.push(whitespacePartContent);
             translationLineList[textBlockTextPartIdx] = whitespacePartContent;
@@ -3278,10 +3300,11 @@ async function importLang(inputPath, targetLang, translationsPathList) {
         }
 
         // TODO rename sourceTextLine to textBlockTextPart
+        // source_text_line = text_block
         const sourceTextLine = textBlockTextPart;
 
         debugAlignment &&
-        console.log("textBlockTextPart", JSON.stringify(textBlockTextPart));
+        console.log(`a=${translatedFileId} b=${textGroupRawParsedIdx} c=${textBlockTextPartIdx} textBlockTextPart ${JSON.stringify(textBlockTextPart)}`);
 
         /*
         if (sourceTextLine.indexOf("\n") > -1) {
@@ -3292,7 +3315,7 @@ async function importLang(inputPath, targetLang, translationsPathList) {
 
         //console.dir({ lastSplittedTranslationIdx, sourceTextLine });
 
-        const sourceTextLineTrimmed = sourceTextLine.trim();
+        //const sourceTextLineTrimmed = sourceTextLine.trim();
         let translatedTextLineSplitted = null;
         let translatedTextLineCombinedJoinedSplitted = null;
 
@@ -3316,6 +3339,9 @@ async function importLang(inputPath, targetLang, translationsPathList) {
         ) {
           // this is always just one line (or less)
           const splittedTranslationLine = splittedTranslationsList[splittedTranslationIdx];
+          if (debugAlignment) {
+            console.log(`a=${translatedFileId} b=${textGroupRawParsedIdx} c=${textBlockTextPartIdx} d=${splittedTranslationIdx} sourceTextLine + splittedTranslationLine = ${JSON.stringify(sourceTextLine)} + ${JSON.stringify(splittedTranslationLine)}`)
+          }
           if (
             // source is empty line
             sourceTextLine.match(/^\s*$/s) != null &&
@@ -3371,7 +3397,8 @@ async function importLang(inputPath, targetLang, translationsPathList) {
           break;
           //console.dir({ splittedTranslation });
           //throw new Error("todo");
-        } // loop lines of the "splitted" translations
+        }
+        // done: loop lines of the "splitted" translations
 
         debugAlignment &&
         console.log(`translatedFileId ${String(translatedFileId).padStart(5)}   textGroupRawParsedIdx ${String(textGroupRawParsedIdx).padStart(5)}   textBlockTextPartIdx ${String(textBlockTextPartIdx).padStart(5)}   splittedTranslationIdx ${String(splittedTranslationIdx).padStart(5)}`);
@@ -3395,16 +3422,19 @@ async function importLang(inputPath, targetLang, translationsPathList) {
           throw new Error(`not found "combined" translation of sourceTextLine: ${sourceTextLine}`);
         }
 
+        // write to text group raw parsed translations
         textGroupRawParsed.translations.splittedTranslationLineList[textBlockTextPartIdx] = translatedTextLineSplitted;
         textGroupRawParsed.translations.joinedTranslationLineList[textBlockTextPartIdx] = translatedTextLineCombinedJoinedSplitted;
 
-      } // loop text parts of this text block
+      }
+      // done: loop text parts of this text block from next
 
       if (stopLoopSourceTextPartsLoop) {
         break;
       }
 
-    } // loop text parts: add aligned translations to textGroupRawParsedList
+    }
+    // done: loop text parts: add aligned translations to textGroupRawParsedList
 
     debugAlignment &&
     console.log(`line 3500: textGroupRawParsedIdx ${textGroupRawParsedIdx}   textGroupRawParsedIdxLast ${textGroupRawParsedIdxLast}`);
@@ -3412,9 +3442,19 @@ async function importLang(inputPath, targetLang, translationsPathList) {
     // undo "textGroupRawParsedIdx++" in the previous for loop
     textGroupRawParsedIdxLast = textGroupRawParsedIdx - 1;
 
+    debugAlignment &&
+    console.log(`line 3505: textGroupRawParsedIdx ${textGroupRawParsedIdx}   textGroupRawParsedIdxLast ${textGroupRawParsedIdxLast}`);
+
+    debugAlignment &&
+    console.log(`line 3510: textBlockTextPartIdxNextLast ${textBlockTextPartIdxNextLast} -> ${textBlockTextPartIdx}`);
+
+    // note: textBlockTextPartIdx was incremented after the last iteration
+    // of "loop text parts of this text block from next"
+    // textBlockTextPartIdx++
     textBlockTextPartIdxNextLast = textBlockTextPartIdx;
 
-  } // loop input files: add source and translated text parts to textGroupRawParsed
+  }
+  // done: loop input files: add source and translated text parts to textGroupRawParsed
 
   console.log(`populating textGroupRawParsedList done`);
 
@@ -3424,8 +3464,6 @@ async function importLang(inputPath, targetLang, translationsPathList) {
 
   // autofix and autosolve translations
   // no. later: write translatedText and translatedHtml
-
-  const translatedTextPartList = [];
 
   let textGroupRawParsedLast; // debug
 
@@ -3453,17 +3491,23 @@ async function importLang(inputPath, targetLang, translationsPathList) {
 
     let textBlockTextPartIdx;
 
-    // loop text parts of this text block
+    debugAlignment &&
+    console.log(`loop from first ...`);
+
+    // loop text parts of this text block from first
     for (textBlockTextPartIdx = 0; textBlockTextPartIdx < textBlockTextPartList.length; textBlockTextPartIdx++) {
 
       debugAlignment &&
-      console.log(`textBlockIdx ${String(textBlockIdx).padStart(5)}   textBlockTextPartIdx ${String(textBlockTextPartIdx).padStart(5)}   (translatedFileId ${String(textGroupRawParsed.translatedFileId).padStart(5)})`);
+      console.log(`loop from first: textBlockIdx ${String(textBlockIdx).padStart(5)}   textBlockTextPartIdx ${String(textBlockTextPartIdx).padStart(5)}   (translatedFileId ${String(textGroupRawParsed.translatedFileId).padStart(5)})`);
 
       const textBlockTextPart = textBlockTextPartList[textBlockTextPartIdx];
       // TODO rename sourceTextLine to textBlockTextPart
       const sourceTextLine = textBlockTextPart;
 
       const sourceTextLineTrimmed = sourceTextLine.trim();
+
+      debugAlignment &&
+      console.log(`3550 sourceTextLineTrimmed ${JSON.stringify(sourceTextLineTrimmed)}`)
 
       if (
         // this part is whitespace only
@@ -3483,6 +3527,7 @@ async function importLang(inputPath, targetLang, translationsPathList) {
       const translatedTextLineSplitted = splittedTranslationLineList[sourceTextLineIdx];
       const translatedTextLineCombinedJoinedSplitted = joinedTranslationLineList[sourceTextLineIdx];
       */
+      // read from text group raw parsed translations
       const translatedTextLineSplitted = textGroupRawParsed.translations.splittedTranslationLineList[textBlockTextPartIdx];
       const translatedTextLineCombinedJoinedSplitted = textGroupRawParsed.translations.joinedTranslationLineList[textBlockTextPartIdx];
 
@@ -3507,7 +3552,7 @@ async function importLang(inputPath, targetLang, translationsPathList) {
 
       // TODO move out
 
-      function autofixTranslations(sourceText, translatedTextList) {
+      function autofixTranslations(sourceText, translatedTextList, targetLang) {
         if (targetLang == "en") {
           translatedTextList = translatedTextList.map(translatedText => {
             // \b = word boundary
@@ -3568,12 +3613,16 @@ async function importLang(inputPath, targetLang, translationsPathList) {
 
       // TODO move out
 
+      // autosolve translations
       function autosolveTranslations(sourceText, translatedTextList) {
 
         // TODO maybe use other autosolve for other targetLang
 
         if (translatedTextList.length <= 1) {
           // 0 or 1 translation. no translations to compare
+          if (debugAlignment) {
+            console.log(`3670 autosolveTranslations 1`)
+          }
           return translatedTextList;
         }
 
@@ -3584,6 +3633,9 @@ async function importLang(inputPath, targetLang, translationsPathList) {
         // source and translations are equal
         for (const translatedText of translatedTextList) {
           if (translatedText == sourceText) {
+            if (debugAlignment) {
+              console.log(`3670 autosolveTranslations 2`)
+            }
             return [translatedText];
           }
         }
@@ -3599,7 +3651,14 @@ async function importLang(inputPath, targetLang, translationsPathList) {
           }
         }
         if (allTranslationsAreEqual) {
+          if (debugAlignment) {
+            console.log(`3670 autosolveTranslations 3`)
+          }
           return [firstTranslatedText];
+        }
+
+        if (debugAlignment) {
+          console.log(`3670 autosolveTranslations 4`)
         }
 
         // check for trivial differences
@@ -3609,10 +3668,17 @@ async function importLang(inputPath, targetLang, translationsPathList) {
 
         const endPunctuationRegex = /[.,?!" ]+$/s;
         const onlyPunctuationRegex = /^[.,?!" ]+$/s;
+
+        // get line end punctuation
         function getLineEndPunctuation(line) {
           return (line.match(endPunctuationRegex) || [])[0];
         }
+
         const sourceTextEndPunctuation = getLineEndPunctuation(sourceText);
+
+        if (debugAlignment) {
+          console.log(`3710 autosolveTranslations 4 sourceTextEndPunctuation ${JSON.stringify(sourceTextEndPunctuation || null)}`);
+        }
 
         if (sourceTextEndPunctuation != undefined) {
           // source line ends with punctuation
@@ -3625,16 +3691,28 @@ async function importLang(inputPath, targetLang, translationsPathList) {
           //   t: Only a few worldviews provide an answer,
           translatedTextList.map(translatedText => {
             if (translatedText.endsWith(sourceTextEndPunctuation) == false) {
+              if (debugAlignment) {
+                console.log(`3670 autosolveTranslations 4 1`)
+              }
               return;
             }
             // translatedText has same end punctuation as sourceText
             // remove other translated texts that only differ in end punctuation
+
             const translatedTextBeforeEndPunctuation = translatedText.slice(0, -1 * sourceTextEndPunctuation.length);
+
+            if (debugAlignment) {
+              console.log(`3670 autosolveTranslations 4 1 translatedTextBeforeEndPunctuation ${JSON.stringify(translatedTextBeforeEndPunctuation)}`)
+            }
+
             translatedTextList = translatedTextList.filter(translatedText2 => {
               if (
                 translatedText2.startsWith(translatedTextBeforeEndPunctuation) == false ||
                 translatedText2 == translatedText
               ) {
+                if (debugAlignment) {
+                  console.log(`3670 autosolveTranslations 4 2`)
+                }
                 return true; // keep translation
               }
               // translatedText2 has same prefix as translatedText, but a different suffix
@@ -3644,12 +3722,21 @@ async function importLang(inputPath, targetLang, translationsPathList) {
                 suffix.match(onlyPunctuationRegex) != null
               ) {
                 // suffix has no words
+                if (debugAlignment) {
+                  console.log(`3670 autosolveTranslations 4 3`)
+                }
                 return false; // remove translation
               }
               // suffix has words
+              if (debugAlignment) {
+                console.log(`3670 autosolveTranslations 4 4`)
+              }
               return true; // keep translation
             });
           });
+          if (debugAlignment) {
+            console.log(`3670 autosolveTranslations 5`)
+          }
           // add missing end punctuation to translated texts
           // de-en-000:89:
           //   s: Wie müssen wir verschiedene Menschen verbinden,
@@ -3678,6 +3765,10 @@ async function importLang(inputPath, targetLang, translationsPathList) {
           });
         }
         else {
+          if (debugAlignment) {
+            console.log(`3670 autosolveTranslations 6`)
+          }
+          // source line does not end with punctuation
           // sourceTextEndPunctuation == undefined
           // source line does NOT end with punctuation
           // prefer translations that also do NOT end with punctuation
@@ -3690,18 +3781,36 @@ async function importLang(inputPath, targetLang, translationsPathList) {
           translatedTextList.map(translatedText => {
             const translatedTextEndPunctuation = getLineEndPunctuation(translatedText);
             if (translatedTextEndPunctuation != undefined) {
+              if (debugAlignment) {
+                console.log(`3670 autosolveTranslations 6 1 translatedTextEndPunctuation ${JSON.stringify(translatedTextEndPunctuation)}`)
+              }
               return;
+            }
+            if (debugAlignment) {
+              console.log(`3670 autosolveTranslations 6 1 translatedText ${JSON.stringify(translatedText)}`)
             }
             // translatedTextEndPunctuation == undefined
             // translatedText also has NO end punctuation
             // remove other translated texts that only differ in end punctuation
             translatedTextList = translatedTextList.filter(translatedText2 => {
+              if (debugAlignment) {
+                console.log(`3670 autosolveTranslations 6 1.5 translatedText2 ${JSON.stringify(translatedText2)}`);
+              }
               if (translatedText2 == translatedText) {
+                if (debugAlignment) {
+                  console.log(`3670 autosolveTranslations 6 2`)
+                }
                 return true; // keep translation
               }
               if (translatedText2.startsWith(translatedText)) {
                 // translatedText2 has same prefix as translatedText, but a different suffix
+                if (debugAlignment) {
+                  console.log(`3670 autosolveTranslations 6 3`)
+                }
                 return false; // remove translation
+              }
+              if (debugAlignment) {
+                console.log(`3670 autosolveTranslations 6 4`)
               }
               return true; // keep translation
             });
@@ -3735,20 +3844,24 @@ async function importLang(inputPath, targetLang, translationsPathList) {
       // because autofix can produce more identical translations
       // which are then reduced by autosolve
 
-      translatedTextLineList = autofixTranslations(sourceTextLineTrimmed, translatedTextLineList);
+      if (debugAlignment) {
+        console.log("3840 sourceTextLineTrimmed", JSON.stringify(sourceTextLineTrimmed));
+        console.log("3840 translatedTextLineList", JSON.stringify(translatedTextLineList));
+      }
+
+      translatedTextLineList = autofixTranslations(sourceTextLineTrimmed, translatedTextLineList, targetLang);
+
+      if (debugAlignment) {
+        console.log("3845 translatedTextLineList", JSON.stringify(translatedTextLineList));
+      }
 
       translatedTextLineList = autosolveTranslations(sourceTextLineTrimmed, translatedTextLineList);
 
-      // no. write back to textGroupRawParsed.translations
-      /*
-      // TODO group text parts by "text block"
-      translatedTextPartList.push({
-        sourceTextLine, // TODO remove?
-        sourceTextLineTrimmed,
-        translatedTextLineList, // one or more translations
-      });
-      */
+      if (debugAlignment) {
+        console.log("3850 translatedTextLineList", JSON.stringify(translatedTextLineList));
+      }
 
+      // write to text group raw parsed translations
       // write back to textGroupRawParsed.translations
       // first translation in translatedTextLineList is the "joined" translation
       textGroupRawParsed.translations.joinedTranslationLineList[textBlockTextPartIdx] = (
@@ -3763,9 +3876,11 @@ async function importLang(inputPath, targetLang, translationsPathList) {
 
       textGroupRawParsedLast = textGroupRawParsed;
 
-    } // loop text parts of this text block
+    }
+    // done: loop text parts of this text block from first
 
-  } // loop source text lines: autofix and autosolve translations in textGroupRawParsed
+  }
+  // done: loop source text lines: autofix and autosolve translations in textGroupRawParsed
 
   console.log(`autofixing and autosolving translations done`);
 
@@ -3898,6 +4013,7 @@ async function importLang(inputPath, targetLang, translationsPathList) {
       */
       //console.dir({ translatedText }); throw new Error("todo");
 
+      // read from text group raw parsed translations
       const joinedTranslationBlockText = textGroupRawParsed.translations.joinedTranslationLineList.join("");
       const splittedTranslationBlockText = textGroupRawParsed.translations.splittedTranslationLineList.join("");
 

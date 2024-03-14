@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+# FIXME translations_db_set is never called
+# $ sqlite3 translations-cache.db "select count(1) from translations_cache" 
+# 0
+
 # TODO export_lang must decode html entities to utf8
 # TODO import_lang must encode html entities from utf8
 
@@ -11,11 +15,9 @@
 
 import os
 import sys
-#import fs
 import re
 import glob
 import io
-#import path
 import json
 import shutil
 import hashlib
@@ -23,8 +25,16 @@ import subprocess
 import html
 import urllib.parse
 import ast
+import asyncio
+import sqlite3
 
 import tree_sitter_languages
+
+# TODO? use aiohttp_chromium
+from selenium_driverless import webdriver
+from selenium_driverless.types.by import By
+
+
 
 tree_sitter_html = tree_sitter_languages.get_parser("html")
 
@@ -100,20 +110,6 @@ def sha1sum(_bytes):
 # https://github.com/grantjenks/py-tree-sitter-languages/issues/59
 # TODO better? get name-id mappings from parser binary?
 
-# with open(os.environ["TREE_SITTER_HTML_SRC"] + "/src/grammar.json", "r") as f:
-#     tree_sitter_html_grammar = json.load(f)
-# # no. names can be ugly names like '"'
-# # import types
-# # node_kind = types.SimpleNamespace(**{
-# #     name: id for id, name in enumerate(tree_sitter_html_grammar["rules"])
-# # })
-# node_kind = {
-#     name: id for id, name in enumerate(tree_sitter_html_grammar["rules"])
-# }
-# print("node_kind =", json.dumps(node_kind, indent=2))
-
-# parse node name-id mapping from src/parser.c
-
 with open(os.environ["TREE_SITTER_HTML_SRC"] + "/src/parser.c", "rb") as f:
     parser_c_src = f.read()
 tree_sitter_c = tree_sitter_languages.get_parser("c")
@@ -145,7 +141,7 @@ if False:
 
     for node in walk_tree(parser_c_tree.root_node):
 
-        node_text = json.dumps(node_source)
+        node_text = json_dumps(node_source)
         if len(node_text) > max_len:
             node_text = node_text[0:max_len] + "..."
 
@@ -217,8 +213,8 @@ for node in walk_tree(parser_c_tree.root_node):
 
         continue
 
-#print("enum_ts_symbol_identifiers =", json.dumps(enum_ts_symbol_identifiers, indent=2))
-#print("char_ts_symbol_names =", json.dumps(char_ts_symbol_names, indent=2))
+#print("enum_ts_symbol_identifiers =", json_dumps(enum_ts_symbol_identifiers, indent=2))
+#print("char_ts_symbol_names =", json_dumps(char_ts_symbol_names, indent=2))
 
 # force user to use exact names from full_node_kind
 # names can collide when grammars
@@ -243,8 +239,8 @@ for full_name, id in enum_ts_symbol_identifiers.items():
 node_name = [None] + list(node_kind.keys())
 
 if show_debug:
-    #print("full_node_kind =", json.dumps(full_node_kind, indent=2))
-    print("node_kind =", json.dumps(node_kind, indent=2))
+    #print("full_node_kind =", json_dumps(full_node_kind, indent=2))
+    print("node_kind =", json_dumps(node_kind, indent=2))
     #print("node_kind document =", node_kind["document"])
 
 # compound tags
@@ -270,8 +266,6 @@ compound_kind_id = set([
 ])
 
 # https://github.com/tree-sitter/py-tree-sitter/issues/33
-#def traverse_tree(tree: Tree):
-#def walk_html_tree(tree, func, filter_compound_nodes=True):
 def walk_html_tree(tree, keep_compound_nodes=False):
     global compound_kind_id
     cursor = tree.walk()
@@ -304,27 +298,234 @@ def walk_html_tree(tree, keep_compound_nodes=False):
 
 
 
+# fs.writeFileSync
+def write_file(file_path, content):
+    with open(file_path, 'w') as file:
+        file.write(content)
+
+
+
+# JSON.stringify
+def json_dumps(obj):
+    return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+
+
+
+# no: TypeError: Object of type RandomWriteList is not JSON serializable
+#import collections
+#class RandomWriteList(collections.UserList):
+
+# https://stackoverflow.com/a/78147717/10440128
+
+class RandomWriteList(list):
+    "list with random write access, like Array in javascript"
+    def __setitem__(self, idx, val):
+        try:
+            super().__setitem__(idx, val)
+        except IndexError:
+            self += [None] * (idx - len(self))
+            self.append(val)
+
+# L = RandomWriteList()
+# L[2] = "2"
+# L[5] = "5"
+# print("L", repr(L))
+# assert L == [None, None, '2', None, None, '5']
+
+
+
+class TranslationsDB():
+
+    def __init__(self, path):
+
+        self.path = path
+        self.con = sqlite3.connect(self.path)
+        self.cur = self.con.cursor()
+
+        self.create_table_source_text()
+        self.create_table_target_text()
+
+    def __del__(self):
+        self.con.commit()
+        self.con.close()
+
+    def create_table_source_text(self):
+
+        # populated by export_lang
+        table_name = "source_text"
+        sql_query = (
+            f"CREATE TABLE {table_name} (\n"
+            "  id INTEGER PRIMARY KEY,\n"
+            #"  key TEXT,\n" TODO? unique translation_key: source_lang + target_lang + source_text_hash
+            "  source_lang TEXT,\n"
+            "  source_text_hash TEXT,\n"
+            #"  source_text_hash BLOB,\n"
+            "  source_text TEXT,\n"
+            "  UNIQUE (source_lang, source_text_hash)\n"
+            ")"
+        )
+        try:
+            self.cur.execute(sql_query)
+        except sqlite3.OperationalError as exc:
+            if exc.args[0] != f"table {table_name} already exists":
+                raise
+
+    def create_table_target_text(self):
+
+        # populated by import_lang
+        table_name = "target_text"
+        sql_query = (
+            f"CREATE TABLE {table_name} (\n"
+            "  id INTEGER PRIMARY KEY,\n"
+            "  source_text_id INTEGER,\n"
+            # TODO with multiple translators, use separate tables for source_text and target_text
+            "  target_lang TEXT,\n"
+            "  translator_name TEXT,\n"
+            "  target_text TEXT,\n"
+            "  target_text_splitted TEXT,\n"
+            "  UNIQUE (source_text_id, target_lang, translator_name)\n"
+            ")"
+        )
+        try:
+            self.cur.execute(sql_query)
+        except sqlite3.OperationalError as exc:
+            if exc.args[0] != f"table {table_name} already exists":
+                raise
+
+    def add_source_text(self, source_lang, source_text_hash, source_text):
+
+        # note: this throws if xxx exists
+        sql_query = (
+            "INSERT INTO source_text ("
+            "  source_lang, source_text_hash, source_text"
+            ") VALUES ("
+            "  ?, ?, ?"
+            ")"
+        )
+        sql_args = (source_lang, source_text_hash, source_text)
+        try:
+            self.cur.execute(sql_query, sql_args)
+            #source_text_id = self.cur.lastrowid
+            #return source_text_id
+        except sqlite3.IntegrityError:
+            # UNIQUE constraint failed: source_text.source_lang, source_text.source_text_hash
+            pass
+
+    def get_source_text_id(self, source_lang, source_text_hash):
+
+        sql_query = (
+            "SELECT id FROM source_text WHERE "
+            "source_lang = ? AND source_text_hash = ? "
+            "LIMIT 1"
+        )
+        sql_args = (source_lang, source_text_hash)
+        row = self.cur.execute(sql_query, sql_args).fetchone()
+        if row == None:
+            return None
+        return row[0]
+
+    def add_target_text(self, source_lang, source_text_hash, target_lang, translator_name, target_text, target_text_splitted):
+
+        # note: this throws if xxx exists
+        source_text_id = self.get_source_text_id(source_lang, source_text_hash)
+        sql_query = (
+            "INSERT INTO target_text ("
+            "  source_text_id, target_lang, translator_name, target_text, target_text_splitted"
+            ") VALUES ("
+            "  ?, ?, ?, ?, ?"
+            ")"
+        )
+        sql_args = (source_text_id, target_lang, translator_name, target_text, target_text_splitted)
+        self.cur.execute(sql_query, sql_args)
+
+    #def has_target_text(self, source_lang, target_lang, source_text_hash):
+    def has_target_text(self, source_lang, source_text_hash, target_lang, translator_name=None):
+
+        source_text_id = self.get_source_text_id(source_lang, source_text_hash)
+        if source_text_id == None:
+            return False
+        sql_query = (
+            "SELECT 1 FROM target_text WHERE "
+            "source_text_id = ? AND target_lang = ? " +
+            ("AND translator_name = ? " if translator_name else "") +
+            "LIMIT 1"
+        )
+        sql_args = [source_text_id, target_lang]
+        if translator_name:
+            sql_args.append(translator_name)
+        return self.cur.execute(sql_query, sql_args).fetchone() != None
+
+    #def get_target_text_list(self, source_lang, target_lang, source_text_hash):
+    def get_target_text(self, source_lang, source_text_hash, target_lang, translator_name):
+
+        "get target_text from one translator"
+
+        source_text_id = self.get_source_text_id(source_lang, source_text_hash)
+        if source_text_id == None:
+            return False
+        sql_query = (
+            "SELECT target_text, target_text_splitted FROM target_text WHERE "
+            "source_text_id = ? AND target_lang = ? AND translator_name = ? "
+            "LIMIT 1"
+        )
+        sql_args = (source_text_id, target_lang, translator_name)
+        return self.cur.execute(sql_query, sql_args).fetchone()
+
+    #def get_target_text_list(self, source_lang, target_lang, source_text_hash):
+    def get_target_text_list(self, source_lang, source_text_hash, target_lang):
+
+        "get target_text from all translators"
+
+        source_text_id = self.get_source_text_id(source_lang, source_text_hash)
+        if source_text_id == None:
+            return False
+        sql_query = (
+            "SELECT translator_name, target_text, target_text_splitted FROM target_text WHERE "
+            "source_text_id = ? AND target_lang = ? "
+        )
+        sql_args = (source_text_id, target_lang)
+        return self.cur.execute(sql_query, sql_args).fetchall()
+
+
+
+# global state
+translations_db = None
+
+
+
 async def export_lang(input_path, target_lang, output_dir=""):
+
+    global translations_db
+
     # tree-sitter expects binary string
     #with open(input_path, 'r') as f:
     with open(input_path, 'rb') as f:
         input_html_bytes = f.read()
-
     input_html_hash = 'sha1-' + hashlib.sha1(input_html_bytes).hexdigest()
-    input_path_frozen = output_dir + input_path + '.' + input_html_hash
+
+    # TODO rename input_path_frozen to output_base
+    #output_base = output_dir + f"{input_path}.{input_html_hash}"
+    #input_path_frozen = output_dir + input_path + '.' + input_html_hash
+    output_dir = os.path.join(os.path.dirname(input_path), output_dir)
+    input_path_frozen = output_dir + os.path.basename(input_path) + '.' + input_html_hash
+
     print(f'writing {input_path_frozen}')
     with open(input_path_frozen, 'wb') as f:
         f.write(input_html_bytes)
 
-    translations_database_html_path_glob = output_dir + 'translations-google-database-*-*.html'
-    translations_database = {}
+    if not translations_db:
+        translations_db = TranslationsDB(output_dir + "translations-cache.db")
 
-    # parse translation databases
-    print("parsing translation databases")
-    for translations_database_html_path in glob.glob(translations_database_html_path_glob):
-        print(f'reading {translations_database_html_path}')
-        with open(translations_database_html_path, 'r') as f:
-            parse_translations_database(translations_database, f.read())
+    # TODO use self.cur
+    # translations_database_html_path_glob = output_dir + 'translations-google-database-*-*.html'
+    # translations_database = {}
+
+    # # parse translation databases
+    # print("parsing translation databases")
+    # for translations_database_html_path in glob.glob(translations_database_html_path_glob):
+    #     print(f'reading {translations_database_html_path}')
+    #     with open(translations_database_html_path, 'r') as f:
+    #         parse_translations_database(translations_database, f.read())
 
     #html_parser = lezer_parser_html.configure()
     html_parser = tree_sitter_html
@@ -362,11 +563,11 @@ async def export_lang(input_path, target_lang, output_dir=""):
 
             is_compound = node.kind_id in compound_kind_id
 
-            node_text = json.dumps(node_source)
+            node_text = json_dumps(node_source)
             if len(node_text) > max_len:
                 node_text = node_text[0:max_len] + "..."
 
-            space_node_text = json.dumps(input_html_bytes[last_node_to:node.range.end_byte].decode("utf8"))
+            space_node_text = json_dumps(input_html_bytes[last_node_to:node.range.end_byte].decode("utf8"))
             if len(space_node_text) > max_len:
                 space_node_text = space_node_text[0:max_len] + "..."
             pfx = "# " if is_compound else "  "
@@ -515,11 +716,7 @@ async def export_lang(input_path, target_lang, output_dir=""):
         return (
             not in_notranslate_block and
             not current_tag.notranslate and
-            # TODO remove. moved to current_tag.notranslate
-            #not current_tag.has_translation and
             current_tag.lang != target_lang
-            # TODO remove. lang inheritance moved to new_tag()
-            #current_lang != target_lang
         )
 
     def write_comment(*a):
@@ -538,16 +735,7 @@ async def export_lang(input_path, target_lang, output_dir=""):
         return "".join(map(lambda t: "/" + format_tag(t), tag_path))
         #return "".join(map(lambda t: "/" + (t.name or "(noname)"), tag_path))
 
-    # def walk_callback(node, is_compound):
-    #     if is_compound:
-    #         return
-    #     # ...
-
-    # def walk_callback_main
-    #def walk_callback(node):
-    #def walk_callback_main(node, is_compound):
-
-    print("walk_html_tree")
+    #print("walk_html_tree")
 
     for node in walk_html_tree(root_node):
 
@@ -621,25 +809,6 @@ async def export_lang(input_path, target_lang, output_dir=""):
             #in_start_tag = False
             write_node()
             continue
-
-            # in_start_tag = False
-            # node_source = input_html_bytes[(last_node_to + 1):node.range.end_byte].decode("utf8")
-            # node_source_space_before = ""
-            # last_node_to = node.range.start_byte - 1
-            # tag_path.pop()
-            # try:
-            #     current_tag = tag_path[-1]
-            # except IndexError:
-            #     current_tag = None
-            # output_template_html.write(
-            #     node_source_space_before + node_source
-            # )
-            # print("output_template_html.write", __line__(), repr(
-            #     node_source_space_before + node_source
-            # ))
-            # # TODO?
-            # last_node_to = node.range.end_byte
-            # continue
 
         if show_debug:
             s2 = repr(node_source)
@@ -853,7 +1022,8 @@ async def export_lang(input_path, target_lang, output_dir=""):
                             # TODO import_lang must encode html entities from utf8
                             #attr_value = html.escape(attr_value_text)
 
-                            attr_value_hash = sha1sum(attr_value.encode("utf8"))
+                            attr_value_hash_bytes = hashlib.sha1(attr_value.encode("utf8")).digest()
+                            attr_value_hash = attr_value_hash_bytes.hex()
                             text_idx = len(text_to_translate_list)
                             node_source_key = f"{text_idx}_{current_lang}_{attr_value_hash}"
                             todo_remove_end_of_sentence = 0
@@ -862,9 +1032,25 @@ async def export_lang(input_path, target_lang, output_dir=""):
                                 attr_value += "."
                                 todo_remove_end_of_sentence = 1
 
-                            translation_key = f"{current_lang}:{target_lang}:{attr_value_hash}"
+                            # translation_key = f"{current_lang}:{target_lang}:{attr_value_hash}"
 
-                            todo_add_to_translations_database = 0 if translation_key in translations_database else 1
+                            has = translations_db.has_target_text(
+                                current_lang,
+                                attr_value_hash,
+                                target_lang,
+                                translator_name
+                            )
+
+                            if not has:
+                                translations_db.add_source_text(
+                                    current_lang,
+                                    attr_value_hash,
+                                    attr_value
+                                )
+
+                            # fix: KeyError: 'en' @ text_groups_raw_by_source_lang[source_lang]
+                            todo_add_to_translations_database = 0 if has else 1
+                            #todo_add_to_translations_database = 1
 
                             if current_lang is None:
                                 source_start = node_source[:100]
@@ -1145,7 +1331,8 @@ async def export_lang(input_path, target_lang, output_dir=""):
                 # let nodeSourceTrimmed = nodeSource;
                 #node_source_trimmed = node_source.strip()
                 node_source_trimmed = node_source
-                node_source_trimmed_hash = sha1sum(node_source_trimmed.encode("utf8"))
+                node_source_trimmed_hash_bytes = hashlib.sha1(node_source_trimmed.encode()).digest()
+                node_source_trimmed_hash = node_source_trimmed_hash_bytes.hex()
                 text_idx = len(text_to_translate_list)
                 node_source_key = f"{text_idx}_{current_lang}_{node_source_trimmed_hash}"
                 todo_remove_end_of_sentence = 0
@@ -1157,8 +1344,25 @@ async def export_lang(input_path, target_lang, output_dir=""):
                 #    node_source_trimmed += "."
                 #    todo_remove_end_of_sentence = 1
 
-                translation_key = f"{current_lang}:{target_lang}:{node_source_trimmed_hash}"
-                todo_add_to_translations_database = 1 if translation_key not in translations_database else 0
+                #translation_key = f"{current_lang}:{target_lang}:{node_source_trimmed_hash}"
+
+                has = translations_db.has_target_text(
+                    current_lang,
+                    node_source_trimmed_hash,
+                    target_lang,
+                    translator_name
+                )
+
+                if not has:
+                    translations_db.add_source_text(
+                        current_lang,
+                        node_source_trimmed_hash,
+                        node_source_trimmed
+                    )
+
+                # fix: KeyError: 'en' @ text_groups_raw_by_source_lang[source_lang]
+                todo_add_to_translations_database = 0 if has else 1
+                #todo_add_to_translations_database = 1
 
                 if current_lang is None:
                     source_start = node_source[:100]
@@ -1241,7 +1445,8 @@ async def export_lang(input_path, target_lang, output_dir=""):
                 # let nodeSourceTrimmed = commentContent;
                 #node_source_trimmed = comment_content.strip()
                 node_source_trimmed = comment_content
-                node_source_trimmed_hash = sha1sum(node_source_trimmed.encode("utf8"))
+                node_source_trimmed_hash_bytes = hashlib.sha1(node_source_trimmed.encode()).digest()
+                node_source_trimmed_hash = node_source_trimmed_hash_bytes.hex()
                 text_idx = len(text_to_translate_list)
                 node_source_key = f"{text_idx}_{comment_lang or current_lang}_{node_source_trimmed_hash}"
                 todo_remove_end_of_sentence = 0
@@ -1253,22 +1458,40 @@ async def export_lang(input_path, target_lang, output_dir=""):
                     node_source_trimmed += "."
                     todo_remove_end_of_sentence = 1
 
-                translation_key = f"{current_lang}:{target_lang}:{node_source_trimmed_hash}"
-                todo_add_to_translations_database = 1 if translation_key not in translations_database else 0
+                #translation_key = f"{current_lang}:{target_lang}:{node_source_trimmed_hash}"
+
+                has = translations_db.has_target_text(
+                    current_lang,
+                    node_source_trimmed_hash,
+                    target_lang,
+                    translator_name
+                )
+
+                if not has:
+                    translations_db.add_source_text(
+                        current_lang,
+                        node_source_trimmed_hash,
+                        node_source_trimmed
+                    )
+
+                # fix: KeyError: 'en' @ text_groups_raw_by_source_lang[source_lang]
+                todo_add_to_translations_database = 0 if has else 1
+                #todo_add_to_translations_database = 1
 
                 if current_lang is None:
                     source_start = node_source[:100]
                     # TODO show "outerHTML". this is only the text node
                     raise ValueError(f"node has no lang attribute: {repr(source_start)}")
 
-                text_to_translate = [
+                text_to_translate = (
                     text_idx,
                     node_source_trimmed_hash,
                     current_lang,
                     node_source_trimmed,
                     todo_remove_end_of_sentence,
+                    # FIXME filter
                     todo_add_to_translations_database,
-                ]
+                )
 
                 text_to_translate_list.append(text_to_translate)
 
@@ -1342,12 +1565,12 @@ async def export_lang(input_path, target_lang, output_dir=""):
     text_to_translate_list_path = output_dir + input_path + '.' + input_html_hash + '.textToTranslateList.json'
     print(f"writing {text_to_translate_list_path}")
     with open(text_to_translate_list_path, 'w') as f:
-        json.dump(text_to_translate_list, f, indent=2)
+        json.dump(text_to_translate_list, f, indent=2, ensure_ascii=False)
 
     html_between_replacements_path = output_dir + input_path + '.' + input_html_hash + '.htmlBetweenReplacementsList.json'
     print(f"writing {html_between_replacements_path}")
     with open(html_between_replacements_path, 'w') as f:
-        json.dump(html_between_replacements_list, f, indent=2)
+        json.dump(html_between_replacements_list, f, indent=2, ensure_ascii=False)
 
     # TODO build chunks of same language
     # limited by charLimit = 5000
@@ -1360,30 +1583,6 @@ async def export_lang(input_path, target_lang, output_dir=""):
     replacement_data['replacementList'] = {}
     replacement_data['lastId'] = -1
     replacement_data_lastId_2 = -1
-
-
-
-    # def fmt_num(num):
-    #     # split long number in groups of three digits
-    #     # https://stackoverflow.com/a/6786040/10440128
-    #     # return `${num}`.replace(/(\d)(?=(\d{3})+$)/g, '$1 ');
-    #     return '{:,}'.format(num)
-
-
-
-    # wrong?
-    # def get_replace(match):
-    #     nonlocal replacement_data
-    #     nonlocal replacement_data_lastId_2
-    #     replacement_id = replacement_data_lastId_2 + 1
-    #     code = encode_num(replacement_id)
-    #     replacement_data['replacementList'][replacement_id] = {
-    #         'value': match,
-    #         'code': code,
-    #         'indentList': []
-    #     }
-    #     replacement_data_lastId_2 += 1
-    #     return f' [{code}] '
 
 
 
@@ -1498,11 +1697,23 @@ async def export_lang(input_path, target_lang, output_dir=""):
     # for (const textToTranslate of textToTranslateList)
     for text_to_translate in text_to_translate_list:
 
-        todo_add_to_translations_database = text_to_translate[5]
+        (
+            text_idx,
+            node_source_trimmed_hash,
+            current_lang,
+            node_source_trimmed,
+            todo_remove_end_of_sentence,
+            # FIXME filter
+            todo_add_to_translations_database,
+        ) = text_to_translate
+
         if todo_add_to_translations_database == 0:
             # filter. dont send this source text to the translator
             # note: add="${textToTranslate[5]}" is always add="1"
             continue
+
+        # FIXME filter
+        assert todo_add_to_translations_database == 0
 
         # why so complex? why do we wrap text in <html>...</html> tags?
         # because we have two levels of replacements?
@@ -1514,7 +1725,13 @@ async def export_lang(input_path, target_lang, output_dir=""):
         #print("text_to_translate[3]", repr(text_to_translate[3]))
 
         # TODO? add source language sl="..."
-        text_to_translate_html = f'<html i="{text_to_translate[0]}" h="{text_to_translate[1]}" rme="{text_to_translate[4]}" add="{text_to_translate[5]}">\n{text_to_translate[3]}\n</html>'
+        text_to_translate_html = (
+            f'<html i="{text_idx}" '
+            f'h="{node_source_trimmed_hash}" '
+            f'rme="{todo_remove_end_of_sentence}" '
+            f'add="{todo_add_to_translations_database}"'
+            f'>\n{node_source_trimmed}\n</html>'
+        )
 
         if show_debug:
             print(f"textPart before replace:\n{text_to_translate_html}")
@@ -1601,6 +1818,9 @@ async def export_lang(input_path, target_lang, output_dir=""):
 
         text_lang = text_to_translate[2]
 
+        # FIXME filter: text_parts_by_lang text_part_raw_list_by_lang
+        # FIXME filter: text_part text_part_raw_list
+
         text_parts_by_lang.setdefault(text_lang, []).append(text_part)
         text_part_raw_list_by_lang.setdefault(text_lang, []).append(text_part_raw_list)
     # loop text_to_translate_list done
@@ -1608,8 +1828,8 @@ async def export_lang(input_path, target_lang, output_dir=""):
     # const replacementDataPath = inputPath + '.' + inputHtmlHash + '.replacementData.json';
     replacement_data_path = output_dir + f'{input_path}.{input_html_hash}.replacementData.json'
     print(f"writing {replacement_data_path}")
-    with open(replacement_data_path, 'w', encoding='utf-8') as f:
-        json.dump(replacement_data, f, indent=2)
+    with open(replacement_data_path, 'w') as f:
+        json.dump(replacement_data, f, indent=2, ensure_ascii=False)
 
 
 
@@ -1621,60 +1841,95 @@ async def export_lang(input_path, target_lang, output_dir=""):
     # loop text_parts_by_lang
     for source_lang in text_parts_by_lang.keys():
 
-        text_parts = text_parts_by_lang[source_lang]
-        text_part_raw_list = text_part_raw_list_by_lang[source_lang]
+        # last_group_size = 0
+        # decode_num_offset = 0
+        # decode_num_last_result = 0
 
-        last_group_size = 0
-        decode_num_offset = 0
-        decode_num_last_result = 0
+        #text_groups = ['']
+        #text_groups_raw = [[]]
+        #this_group_length = 0
 
-        text_groups = ['']
-        text_groups_raw = [[]]
-        this_group_length = 0
+        # FIXME filter: text_part_list text_part_raw_list
+        # FIXME filter: text_parts_by_lang text_part_raw_list_by_lang
 
-        # loop text_parts
+        # loop text_part_list
         # for (let textPartsIdx = 0; textPartsIdx < textParts.length; textPartsIdx++)
-        for source_lang, text_parts in text_parts_by_lang.items():
+        for source_lang, text_part_list in text_parts_by_lang.items():
 
+            # TODO replace text_part_list with text_part_raw_list
             # const textParts = textPartsByLang[source_lang];
             text_part_raw_list = text_part_raw_list_by_lang[source_lang]
+
             last_group_size = 0
             decode_num_offset = 0
             decode_num_last_result = 0
+
             text_groups = ['']
             text_groups_raw = [[]]
             this_group_length = 0
 
-            for text_parts_idx in range(len(text_parts)):
+            for text_part_idx in range(len(text_part_list)):
+
+                # note: text_part != source_text
+                # text_part " [ref0] who are my friends, [ref1] team composition, [ref2] matchmaking ...
+                # source_text "who are my friends,"
 
                 # TODO where do we store all source text parts?
-                source_text = text_parts[text_parts_idx]
-                text_part_raw = text_part_raw_list[text_parts_idx]
+                # FIXME filter: text_part_list text_part_raw_list
+                # TODO? remove text_part_list, use only text_part_raw_list
+                text_part = text_part_list[text_part_idx]
+                text_part_raw = text_part_raw_list[text_part_idx]
 
                 # check 2: sourceText versus textPartRaw
                 # TODO remove?
-                source_text_actual = stringify_raw_text_group(text_part_raw)
-                if source_text_actual != source_text:
+                text_part_actual = stringify_raw_text_group(text_part_raw)
+                if text_part_actual != text_part:
                     raise ValueError("sourceTextActual != sourceText")
 
                 # filter textPart
                 # TODO where do we store all source text parts?
                 # groups.json and textGroupsRawByLang.json have filtered text parts
-                text_part_hash = source_lang + ':' + target_lang + ':' + hashlib.sha1(source_text.encode()).hexdigest()
-                if text_part_hash in translations_database:
-                    # translation exists in local database
-                    # TODO why do we reach this so rarely?
-                    # most text parts are still sent to the translator
-                    # maybe we sourceText contains dynamic strings (replacement codes)
-                    continue
+                text_part_hash_bytes = hashlib.sha1(text_part.encode()).digest()
+                text_part_hash = text_part_hash_bytes.hex()
+                #text_part_hash = source_lang + ':' + target_lang + ':' + hashlib.sha1(text_part.encode()).hexdigest()
+                #if text_part_hash in translations_database:
+
+                # text_part is not stored in the source_text table
+                # so translations_db.has_target_text always returns false
+                # no. fix: KeyError: 'en' @ text_groups_raw_by_source_lang[source_lang]
+                # has = translations_db.has_target_text(
+                #     source_lang,
+                #     text_part_hash,
+                #     target_lang,
+                #     translator_name
+                # )
+                # if has:
+                #     # translation exists in local database
+                #     # TODO why do we reach this so rarely?
+                #     # most text parts are still sent to the translator
+                #     # maybe we sourceText contains dynamic strings (replacement codes)
+                #     continue
+
+                # print("not has", (
+                #     source_lang,
+                #     text_part_hash,
+                #     target_lang,
+                #     translator_name
+                # ))
+                # not has (None, '313e7259db63ff5908d388d7289bcb1eaf2b23ec', 'de', 'google')
+
+                #print("text_part", json_dumps(text_part))
+                # FIXME use translated parts from db: "who are my friends,"
+                # FIXME filter: text_part_list text_part_raw_list
+                # text_part " [ref0] who are my friends, [ref1] team composition, [ref2] matchmaking ...
 
                 # TODO why `\n\n<meta attrrrrrrrr="vallll"/>\n\n`
                 # sure, the purpose is to make sure
                 # that the text group is smaller than charLimit
                 # but why do we have to round the length here?
 
-                this_group_length_next = this_group_length + len(source_text)
-                
+                this_group_length_next = this_group_length + len(text_part)
+
                 # TODO remove
                 this_group_string = stringify_raw_text_group(text_groups_raw[-1])
                 this_group_length_expected = len(this_group_string)
@@ -1820,22 +2075,20 @@ async def export_lang(input_path, target_lang, output_dir=""):
 
                 text_groups_raw[-1].extend(text_part_raw)
                 last_group_size += 1 # TODO remove?
-                this_group_length += len(source_text)
+                this_group_length += len(text_part)
 
-                # TODO remove
-                if False:
-                    this_group_string = stringify_raw_text_group(text_groups_raw[-1])
-                    this_group_length_expected = len(this_group_string)
-                    if this_group_length != this_group_length_expected:
-                        raise ValueError("thisGroupLengthExpected != thisGroupLengthExpected")
+            text_groups_by_lang[source_lang] = [
+                ''.join(
+                    part[0] if part[1] == 0 else f' [ref{part[2]}] ' for part in text_group_raw
+                ) for text_group_raw in text_groups_raw
+            ]
 
-            text_groups_by_lang[source_lang] = [''.join(part[0] if part[1] == 0 else f' [ref{part[2]}] ' for part in text_group_raw) for text_group_raw in text_groups_raw]
             text_groups_raw_by_source_lang[source_lang] = text_groups_raw
 
             if show_debug:
                 print('\n'.join([f"textGroup {source_lang} {i}:\n{s}\n" for i, s in enumerate(text_groups_by_lang[source_lang])]))
 
-        # loop text_parts end
+        # loop text_part_list end
 
 
 
@@ -1846,10 +2099,14 @@ async def export_lang(input_path, target_lang, output_dir=""):
             ''.join(part[0] if part[1] == 0 else f' [ref{part[2]}] ' for part in text_part_raw)
             for text_part_raw in text_groups_raw
         ]
+
         text_groups_raw_by_source_lang[source_lang] = text_groups_raw
+
         text_groups_by_lang[source_lang] = text_groups_new_code
+
         if show_debug:
             print('\n'.join([f"textGroup {source_lang} {i}:\n{s}\n" for i, s in enumerate(text_groups_new_code)]))
+
     # loop text_parts_by_lang done
 
 
@@ -1857,9 +2114,9 @@ async def export_lang(input_path, target_lang, output_dir=""):
     # Write to textPartsByLang.json
     # const textPartsByLangPath = inputPath + '.' + inputHtmlHash + '.textPartsByLang.json';
     text_parts_by_lang_path = output_dir + f"{input_path}.{input_html_hash}.textPartsByLang.json"
-    print(f"Writing {text_parts_by_lang_path}")
+    print(f"writing {text_parts_by_lang_path}")
     with open(text_parts_by_lang_path, "w") as file:
-        json.dump(text_parts_by_lang, file, indent=2)
+        json.dump(text_parts_by_lang, file, indent=2, ensure_ascii=False)
 
     # TODO rename to filtered-groups
     # TODO rename to filtered-groups-raw
@@ -1869,17 +2126,18 @@ async def export_lang(input_path, target_lang, output_dir=""):
 
     # Write to textGroupsByLang.json
     text_groups_path = output_dir + f"{input_path}.{input_html_hash}.textGroupsByLang.json"
-    print(f"Writing {text_groups_path}")
+    print(f"writing {text_groups_path}")
     with open(text_groups_path, "w") as file:
-        json.dump(text_groups_by_lang, file, indent=2)
+        json.dump(text_groups_by_lang, file, indent=2, ensure_ascii=False)
 
     # Write to textGroupsRawByLang.json
     text_groups_raw_by_lang_path = output_dir + f"{input_path}.{input_html_hash}.textGroupsRawByLang.json"
-    print(f"Writing {text_groups_raw_by_lang_path}")
+    print(f"writing {text_groups_raw_by_lang_path}")
     with open(text_groups_raw_by_lang_path, "w") as file:
-        json.dump(text_groups_raw_by_source_lang, file, indent=2)
+        json.dump(text_groups_raw_by_source_lang, file, indent=2, ensure_ascii=False)
 
-
+    # TODO interleave joined and splitted texts more fine-grained
+    # produce a stream of sentences: joined, splitted, joined, splitted, ...
 
     # finally... send the text groups to the translation service
     # FIXME this can fail, then we have to retry
@@ -1924,7 +2182,8 @@ async def export_lang(input_path, target_lang, output_dir=""):
         return s
 
     # Generate links
-    translate_links = []
+    translate_url_list = []
+    #translate_links = []
     for source_lang in text_groups_by_lang:
         if source_lang == target_lang:
             continue
@@ -1938,47 +2197,75 @@ async def export_lang(input_path, target_lang, output_dir=""):
                     if translator_name == 'deepl' else
                     '#invalid-translatorName'
                 )
-                preview_text = (
-                    html_entities_encode(text_group[:preview_text_length//2]) + ' ... ' +
-                    html_entities_encode(text_group[-preview_text_length//2:])
-                ).replace('\n', ' ')
-                link_id = (
-                    f"{text_group_raw_idx}-joined" if export_fn == join_text else
-                    f"{text_group_raw_idx}-splitted" if export_fn == split_text else
-                    f"{text_group_raw_idx}"
+                # preview_text = (
+                #     html_entities_encode(text_group[:preview_text_length//2]) + ' ... ' +
+                #     html_entities_encode(text_group[-preview_text_length//2:])
+                # ).replace('\n', ' ')
+                # 04d: zero-pad ids to 0001 etc -> sort is numeric sort
+                # see also translations_base_name_match
+                link_id = f"translation-{source_lang}-{target_lang}-{text_group_raw_idx:04d}" + (
+                    f"-joined" if export_fn == join_text else
+                    f"-splitted" if export_fn == split_text else
+                    f""
                 )
-                translate_links.append(
-                    f'<div id="group-{link_id}">group {link_id}: <a target="_blank" href="{translate_url}">'
-                    f"{source_lang}:{target_lang}: {preview_text}</a></div>\n"
-                )
+                translate_item = (link_id, translate_url)
+                translate_url_list.append(translate_item)
+                # translate_links.append(
+                #     f'<div id="group-{link_id}">group {link_id}: <a target="_blank" href="{translate_url}">'
+                #     f"{source_lang}:{target_lang}: {preview_text}</a></div>\n"
+                # )
 
-    html_src = (
-        '<style>' +
-        'a:visited { color: green; }' +
-        'a { text-decoration: none; }' +
-        'a:hover { text-decoration: underline; }' +
-        'div { margin-bottom: 1em; }' +
-        '</style>\n' +
-        '<div id="groups">\n' + ''.join(translate_links) + '</div>\n'
-    )
+    # html_src = (
+    #     '<style>' +
+    #     'a:visited { color: green; }' +
+    #     'a { text-decoration: none; }' +
+    #     'a:hover { text-decoration: underline; }' +
+    #     'div { margin-bottom: 1em; }' +
+    #     '</style>\n' +
+    #     '<div id="groups">\n' + ''.join(translate_links) + '</div>\n'
+    # )
 
-    translate_links_path = output_dir + f"{input_path}.{input_html_hash}.translate-{target_lang}.html"
-    print(f"writing {translate_links_path}")
-    with open(translate_links_path, 'w', encoding='utf-8') as file:
-        file.write(html_src)
+    # translate_links_path = output_dir + f"{input_path}.{input_html_hash}.translate-{target_lang}.html"
+    # print(f"writing {translate_links_path}")
+    # with open(translate_links_path, 'w') as file:
+    #     file.write(html_src)
 
-    translate_links_path_url = 'file://' + os.path.abspath(translate_links_path)
-    print("translate_links_path_url:")
-    print(translate_links_path_url)
+    # translate_links_path_url = 'file://' + os.path.abspath(translate_links_path)
+    # print("translate_links_path_url:")
+    # print(translate_links_path_url)
+
+    translate_url_list_path = input_path_frozen + f".translateUrlList-{target_lang}.json"
+    print(f"writing {translate_url_list_path}")
+    with open(translate_url_list_path, 'w') as file:
+        json.dump(translate_url_list, file, indent=2, ensure_ascii=False)
+
+    return input_path_frozen
 
 
 
-async def import_lang(input_path, target_lang, translations_path_list, output_dir=""):
+#async def import_lang(input_path, target_lang, translations_path_list, output_dir=""):
+#async def import_lang(input_path, target_lang, output_dir, translations_path_list=None):
+async def import_lang(input_path, target_lang, output_dir, translations_path_list):
+
+    global translations_db
+
+    if not translations_db:
+        translations_db = TranslationsDB(output_dir + "translations-cache.db")
+
     print(f"reading {input_path}")
     with open(input_path, 'r') as file:
         input_html_bytes = file.read()
     input_html_hash = 'sha1-' + hashlib.sha1(input_html_bytes.encode('utf-8')).hexdigest()
-    input_path_frozen = output_dir + input_path + '.' + input_html_hash
+
+    output_dir = os.path.join(os.path.dirname(input_path), output_dir)
+
+    if input_path.endswith(input_html_hash):
+        # input path is already frozen
+        input_path_frozen = input_path
+    else:
+        #input_path_frozen = output_dir + input_path + '.' + input_html_hash
+        input_path_frozen = output_dir + os.path.basename(input_path) + '.' + input_html_hash
+
     output_template_html_path = input_path_frozen + '.outputTemplate.html'
     text_to_translate_list_path = input_path_frozen + '.textToTranslateList.json'
     replacement_data_path = input_path_frozen + '.replacementData.json'
@@ -1986,18 +2273,20 @@ async def import_lang(input_path, target_lang, translations_path_list, output_di
     text_groups_raw_by_lang_path = input_path_frozen + '.textGroupsRawByLang.json'
     html_between_replacements_path = input_path_frozen + '.htmlBetweenReplacementsList.json'
     text_parts_by_lang_path = input_path_frozen + '.textPartsByLang.json'
-    translated_html_path = input_path_frozen + '.translated.html'
-    translated_splitted_html_path = input_path_frozen + '.translated.splitted.html'
-    translations_database_html_path_glob = output_dir + 'translations-google-database-*-*.html'
-    translations_database = {}
+    translated_html_path = input_path_frozen + f'.translated-{target_lang}.html'
+    translated_splitted_html_path = input_path_frozen + f'.translated-{target_lang}.splitted.html'
 
-    for translations_database_html_path in glob.glob(translations_database_html_path_glob):
-        print(f"reading {translations_database_html_path}")
-        size_before = len(translations_database)
-        with open(translations_database_html_path, 'r') as file:
-            parse_translations_database(translations_database, file.read())
-        size_after = len(translations_database)
-        print(f"loaded {size_after - size_before} translations from {translations_database_html_path}")
+    # TODO use self.cur
+    # translations_database_html_path_glob = output_dir + 'translations-google-database-*-*.html'
+    # translations_database = {}
+
+    # for translations_database_html_path in glob.glob(translations_database_html_path_glob):
+    #     print(f"reading {translations_database_html_path}")
+    #     size_before = len(translations_database)
+    #     with open(translations_database_html_path, 'r') as file:
+    #         parse_translations_database(translations_database, file.read())
+    #     size_after = len(translations_database)
+    #     print(f"loaded {size_after - size_before} translations from {translations_database_html_path}")
 
     input_path_list = [
         input_path_frozen,
@@ -2039,7 +2328,7 @@ async def import_lang(input_path, target_lang, translations_path_list, output_di
     print(f"reading {text_to_translate_list_path}")
     with open(text_to_translate_list_path, 'r') as file:
         text_to_translate_list = json.load(file)
-        raise "todo"
+        #raise "todo"
 
     translations_path_list.sort()
 
@@ -2058,107 +2347,1053 @@ async def import_lang(input_path, target_lang, translations_path_list, output_di
 
     print("populating textGroupRawParsedList ...")
 
+    # loop input files: add source and translated text parts to textGroupRawParsed 
     for translated_file_id in range(len(translations_path_list) // 2):
 
+        if debug_alignment:
+            # console.log(`translatedFileId ${String(translatedFileId).padStart(5)}`);
+            print(f"translatedFileId {translated_file_id:5d}")
+
         # this indexing is based on the sort order
-        # 00-joined
-        # 00-splitted
-        # 01-joined
-        # 01-splitted
+        # 0000-joined
+        # 0000-splitted
+        # 0001-joined
+        # 0001-splitted
 
         joined_translations_path = translations_path_list[translated_file_id * 2]
         splitted_translations_path = translations_path_list[translated_file_id * 2 + 1]
 
-        print(f"translatedFileId {translated_file_id}")
-        print(f"joinedTranslationsPath {joined_translations_path}")
-        print(f"splittedTranslationsPath {splitted_translations_path}")
-        print(f"textGroupRawParsedIdxLast {text_group_raw_parsed_idx_last}")
+        #print(f"textGroupRawParsedIdxLast {text_group_raw_parsed_idx_last}")
+
+        #print(f"joinedTranslationsPath {joined_translations_path}")
+        #print(f"splittedTranslationsPath {splitted_translations_path}")
 
         if not joined_translations_path.endswith("-joined.txt"):
-            raise value_error(f"error: not found the '-joined.txt' suffix in joinedTranslationsPath: {joined_translations_path}")
+            raise ValueError(f"error: not found the '-joined.txt' suffix in joinedTranslationsPath: {joined_translations_path}")
         if not splitted_translations_path.endswith("-splitted.txt"):
-            raise value_error(f"error: not found the '-splitted.txt' suffix in splittedTranslationsPath: {splitted_translations_path}")
+            raise ValueError(f"error: not found the '-splitted.txt' suffix in splittedTranslationsPath: {splitted_translations_path}")
 
-        translations_base_path = os.path.splitext(joined_translations_path)[0]
-        splitted_translations_base_path = os.path.splitext(splitted_translations_path)[0]
+        translations_base_path = joined_translations_path[:(-1 * len("-joined.txt"))]
+        splitted_translations_base_path = splitted_translations_path[:(-1 * len("-splitted.txt"))]
         if translations_base_path != splitted_translations_base_path:
-            raise value_error("joinedTranslationsBasePath != splittedTranslationsBasePath")
+            print(f"joinedTranslationsBasePath {translations_base_path}")
+            print(f"splittedTranslationsBasePath {splitted_translations_base_path}")
+            raise ValueError("joinedTranslationsBasePath != splittedTranslationsBasePath")
 
+        # example: xxx.translation-en-de-0001
         translations_base_name = os.path.basename(translations_base_path)
-        translations_base_name_match = re.match(r'^([a-zA-Z_]+)-([a-zA-Z_]+)-([0-9]+)$', translations_base_name)
+        translations_base_name_match = re.search(r"\.translation-([a-z_]+)-([a-z_]+)-([0-9]{4})$", translations_base_name)
         if translations_base_name_match is None:
-            raise value_error(f"failed to parse translationsBaseName: {translations_base_name}")
+            raise ValueError(f"failed to parse translationsBaseName: {translations_base_name}")
         source_lang, target_lang, translation_file_idx_str = translations_base_name_match.groups()
         translation_file_idx = int(translation_file_idx_str)
 
-        text_group_raw_list = text_groups_raw_by_source_lang.get(source_lang)
-        if text_group_raw_list is None:
-            raise value_error(f"failed to get textGroupRawList for source_lang {source_lang}")
-        if len(text_group_raw_list) != len(text_to_translate_list):
-            raise value_error(f"textGroupRawList.len {len(text_group_raw_list)} != textToTranslateList.len {len(text_to_translate_list)} for source_lang {source_lang}")
-        text_group_raw = text_group_raw_list[text_group_raw_parsed_idx_last]
-        text_group_raw_parsed_idx_last += 1
+        # FIXME KeyError: 'en' @ text_groups_raw_by_source_lang[source_lang]
+        # const textGroupRawList = textGroupsRawBySourceLang[sourceLang][translationFileIdx];
+        text_group_raw_list = text_groups_raw_by_source_lang[source_lang][translation_file_idx]
 
-        if text_group_raw_parsed is None:
-            text_group_raw_parsed = parse_text_group_raw(text_group_raw, text_to_translate_list)
-            text_group_raw_parsed_list.append(text_group_raw_parsed)
-        else:
-            if text_group_raw_parsed['textGroupRaw'] != text_group_raw:
-                raise value_error("textGroupRawParsedList[-1]['textGroupRaw'] != textGroupRaw")
-            if len(text_group_raw_parsed_list) <= text_group_raw_parsed_idx_last:
-                raise value_error("textGroupRawParsedList.len <= textGroupRawParsedIdxLast")
-            text_group_raw_parsed_list[text_group_raw_parsed_idx_last] = parse_text_group_raw(text_group_raw, text_to_translate_list)
+        debug_text_group_raw_parser = True # TODO move up
+        debug_text_group_raw_parser = False # TODO move up
 
-        text_block_text_part_idx_next_last = text_block_text_part_idx_next
+        # add values to textGroupRawParsed.text_block_text_part_list
+        # parse text groups = source text blocks
+        # each source text block is identified by its sourceTextBlockHash
+        # TODO rename text_group_raw to text_part_node
+        for text_group_raw in text_group_raw_list:
+            if debug_text_group_raw_parser:
+                print("text_group_raw", repr(text_group_raw))
+            if text_group_raw[1] == 1:
+                # Replacement: <html> or </html> or whitespace (or other HTML code?)
+                if text_group_raw[0].startswith('<html '):
+                    # Start of block
+                    # Parse HTML tag attributes
+                    if debug_text_group_raw_parser:
+                        print("text_group_raw[0]", repr(text_group_raw[0]))
+                    (
+                        source_text_block_idx,
+                        source_text_block_hash,
+                        todo_remove_end_of_sentence,
+                        todo_add_to_translations_database,
+                        whitespace_before_first_text_part,
+                    ) = re.match(
+                        r'^<html i="([0-9]+)" h="([^"]*)" rme="([01])" add="([01])">\n(.*)$',
+                        text_group_raw[0],
+                        re.DOTALL
+                    ).groups()
 
-        text_block_text_part_idx_next, replacements_count = merge_translations(text_group_raw_parsed, joined_translations_path, splitted_translations_path, text_block_text_part_idx_next)
+                    source_text_block_idx = int(source_text_block_idx)
+                    todo_remove_end_of_sentence = int(todo_remove_end_of_sentence)
+                    todo_add_to_translations_database = int(todo_add_to_translations_database)
 
-        print(f"replacementsCount {replacements_count}")
+                    if source_text_block_hash == "":
+                        # TODO handle empty source_text_block_hash
+                        pass
+                    if todo_remove_end_of_sentence == 1:
+                        # TODO handle todo_remove_end_of_sentence == 1
+                        pass
 
-    print("sorting textGroupRawParsedList by keys ...")
+                    text_group_raw_parsed_new = {
+                        # FIXME? camelCase for js compat
+                        "translated_file_id": translated_file_id,
+                        "source_text_block_idx": source_text_block_idx,
+                        "source_text_block_hash": source_text_block_hash,
+                        # TODO translation_line_list = RandomWriteList()
+                        "text_block_text_part_list": RandomWriteList([whitespace_before_first_text_part]),
+                        # TODO translation_line_list = RandomWriteList()
+                        "text_block_text_part_is_text_list": RandomWriteList([False]),
+                        "todo_remove_end_of_sentence": todo_remove_end_of_sentence,
+                        "todo_add_to_translations_database": todo_add_to_translations_database,
+                        "translations": {
+                            # TODO add more translations
+                            # TODO translation_line_list = RandomWriteList()
+                            "splittedTranslationLineList": RandomWriteList(),
+                            "joinedTranslationLineList": RandomWriteList(),
+                        }
+                    }
 
-    text_group_raw_parsed_list_sorted = sorted(text_group_raw_parsed_list, key=lambda item: item['key'])
+                    text_group_raw_parsed_list.append(text_group_raw_parsed_new)
+                    text_group_raw_parsed = text_group_raw_parsed_new
 
-    print("writing textPartsByLang ...")
+                # else if (textGroupRaw[0].endsWith("\n</html>"))
+                elif text_group_raw[0].endswith("\n</html>"):
+                    # end of block
 
-    text_parts_by_lang = {}
+                    # TODO handle todoRemoveEndOfSentence == 1 (here?)
+                    # 8 == len("\n</html>")
+                    whitespace_after_last_text_part = text_group_raw[0][:-8]
+                    debug_text_group_raw_parser = True # TODO move up
+                    debug_text_group_raw_parser = False # TODO move up
+                    # TODO text_group_raw[0]
+                    if debug_text_group_raw_parser:
+                        print("text_group_raw", repr(text_group_raw))
+                        print("whitespace_after_last_text_part", repr(whitespace_after_last_text_part))
+                    text_group_raw_parsed["text_block_text_part_list"].append(whitespace_after_last_text_part)
+                    text_group_raw_parsed["text_block_text_part_is_text_list"].append(False)
+                    # TODO later: add whitespace to translations
 
-    for text_group_raw_parsed in text_group_raw_parsed_list_sorted:
-        text_parts_by_lang_item = {
-            "inputHtml": text_group_raw_parsed['inputHtml'],
-            "inputPath": text_group_raw_parsed['inputPath'],
-            "inputPathFrozen": text_group_raw_parsed['inputPathFrozen'],
-            "outputTemplateHtml": text_group_raw_parsed['outputTemplateHtml'],
-            "outputTemplatePath": text_group_raw_parsed['outputTemplatePath'],
-            "textPartsByLang": text_group_raw_parsed['textPartsByLang'],
-            "textToTranslateList": text_group_raw_parsed['textToTranslateList'],
+                    if text_group_raw_parsed["todo_remove_end_of_sentence"] == 1:
+
+                        text_block_text_part_list = text_group_raw_parsed["text_block_text_part_list"]
+
+                        idx = len(text_block_text_part_list) - 1
+                        if whitespace_after_last_text_part == "":
+                            # "." is in previous text part. TODO why? this was working before...
+                            idx = idx - 1
+                        if debug_alignment:
+                            print("3000 textBlockTextPartList[idx]", json_dumps(text_block_text_part_list[idx]))
+                        end = text_block_text_part_list[idx][-1]
+                        if end != ".":
+                            # unexpected end
+                            raise ValueError(f"unexpected end: {end}")
+                        # remove last char
+                        text_block_text_part_list[idx] = text_block_text_part_list[idx][:-1]
+                    text_group_raw_parsed = None
+
+                else:
+                    #if text_group_raw[0].match(r'^\s+$') is None:
+                    if re.match(r'^\s+$', text_group_raw[0]) == None:
+                        # Unexpected replacement
+                        raise ValueError(f"Unexpected replacement: {json_dumps(text_group_raw[0])}")
+                    # Whitespace. Usually this is indent of lines
+                    whitespace_between_parts = text_group_raw[0]
+                    text_group_raw_parsed["text_block_text_part_list"].append(whitespace_between_parts)
+                    text_group_raw_parsed["text_block_text_part_is_text_list"].append(False)
+            else:
+                # Add text part to text block
+                text_group_raw_parsed["text_block_text_part_list"].append(text_group_raw[0])
+                text_group_raw_parsed["text_block_text_part_is_text_list"].append(True)
+        # done: add values to textGroupRawParsed.text_block_text_part_list
+
+
+
+        # Read joined translations
+        # print(f"reading {joined_translations_path}")
+        with open(joined_translations_path) as f:
+            joined_translations_text_raw = f.read()
+
+        # Read splitted translations
+        # print(f"reading {splitted_translations_path}")
+        with open(splitted_translations_path) as f:
+            splitted_translations_text_raw = f.read()
+
+        # cleanup translation text
+        def cleanup_translation(text):
+            #global remove_regex_char_class
+            # remove unwanted characters
+            text = re.sub(rf'[{remove_regex_char_class}]', '', text)
+            # Fix double quotes
+            text = re.sub(r'[\u201c\u201d\u201e\u2033\u02dd\u030b\u030e\u05f4\u3003]', '"', text)
+            # Fix single quotes
+            text = re.sub(r'[\u2018\u2019\u02b9\u02bc\u02c8\u0301\u030d\u05f3\u2032]', "'", text)
+            # Move comma out of quotes
+            text = text.replace(',"', '",') # FIXME? re.sub
+            # Replace "asdf..." with "asdf ..."
+            text = re.sub(r'([a-z])\.\.\.(\b|$)', r'\1 ...', text)
+            return text
+
+        # Cleanup joined translations
+        joined_translations_text = cleanup_translation(joined_translations_text_raw)
+
+        # Cleanup splitted translations
+        splitted_translations_text = cleanup_translation(splitted_translations_text_raw)
+
+        # Combine content of "joined" and structure of "splitted" translations
+        # Execute git diff command
+        def exec_process(args, options={}):
+            kwargs = dict(
+                encoding="utf8",
+                capture_output=True,
+            )
+            if options.get("allow_non_zero_status", False) == False:
+                kwargs["check"] = True
+            proc = subprocess.run(args, **kwargs)
+            return proc
+            # exec_options = {
+            #     "encoding": "utf8",
+            #     "maxBuffer": 100*1024*1024, # 100 MiB
+            #     "windowsHide": True,
+            #     **options
+            # }
+            # proc = child_process.spawnSync(args[0], args[1:], exec_options)
+            # if not options.get("allow_non_zero_status", False):
+            #     if proc.status != 0:
+            #         raise ValueError(f"Command {args[0]} failed with status {proc.status}")
+            # if not options.get("allow_error", False):
+            #     if proc.error:
+            #         raise ValueError(f"Command {args[0]} failed with error {proc.error}")
+            # return proc
+
+        # Get system user ID
+        #system_user_id = exec_process(["id", "-u"]).stdout.strip()
+        system_user_id = os.getuid()
+
+        # Define temporary directory path
+        tempdir_path = f"/run/user/{system_user_id}"
+
+        # Define temporary file paths for joined and splitted translations
+        joined_translations_text_temp_path = f"{tempdir_path}/translate-js-translation-joined.txt"
+        splitted_translations_text_temp_path = f"{tempdir_path}/translate-js-translation-splitted.txt"
+
+        # Write joined translations to temporary file
+        write_file(joined_translations_text_temp_path, joined_translations_text)
+
+        # Write splitted translations to temporary file
+        write_file(splitted_translations_text_temp_path, splitted_translations_text)
+
+        # Define arguments for git diff command
+        git_diff_args = [
+            "git", "diff",
+            "--no-index", # compare files outside a git repo
+            "--word-diff=color", # produce a fine-grained diff
+            "--word-diff-regex=.", # character diff: compare every character, also whitespace
+        ]
+
+
+
+
+
+        # Define arguments for git diff command
+        git_diff_joined_splitted_args = [
+            *git_diff_args,
+            joined_translations_text_temp_path,
+            splitted_translations_text_temp_path,
+        ]
+
+        # Define options for git diff command
+        git_diff_options = {
+            "allow_non_zero_status": True,
         }
-        key = text_group_raw_parsed['key']
-        if key in text_parts_by_lang:
-            raise value_error(f"error: key '{key}' already exists in textPartsByLang")
-        text_parts_by_lang[key] = text_parts_by_lang_item
 
-    with open(text_parts_by_lang_path, 'w') as file:
-        json.dump(text_parts_by_lang, file, indent=4, ensure_ascii=False)
+        # Execute git diff command
+        diff_joined_splitted_translations_text = exec_process(git_diff_joined_splitted_args, git_diff_options).stdout
+        diff_body_start_pos = 0
 
-    print(f"writing {translated_splitted_html_path} ...")
+        # Find the start position of the diff body
+        for i in range(5):
+            diff_body_start_pos = diff_joined_splitted_translations_text.find("\n", diff_body_start_pos + 1)
 
-    with open(translated_splitted_html_path, 'wb') as file:
-        file.write(text_group_raw_parsed_list_sorted[0]['inputHtml'])
+        diff_body_start_pos += 1
 
-    print(f"writing {translated_html_path} ...")
+        # Remove ANSI escape codes and unwanted characters from the diff output
+        combined_joined_splitted_translations_text = re.sub(r'\x1b\[32m.*?\x1b\[m', '', diff_joined_splitted_translations_text[diff_body_start_pos:])
+        combined_joined_splitted_translations_text = re.sub(r'\x1b\[[0-9;:]*[a-zA-Z]', '', combined_joined_splitted_translations_text)
 
-    with open(translated_html_path, 'wb') as file:
-        for text_group_raw_parsed in text_group_raw_parsed_list_sorted:
-            output_html = substitute_translations(text_group_raw_parsed)
-            file.write(output_html)
+        # Define a flag for debugging the other diff
+        debug_also_do_the_other_diff = False
 
-    print(f"done: output html files: {translated_html_path} {translated_splitted_html_path}")
-    return 0
+        # Perform the other diff if debugging is enabled
+        if debug_also_do_the_other_diff:
+            git_diff_splitted_joined_args = [
+                *git_diff_args,
+                splitted_translations_text_temp_path,
+                joined_translations_text_temp_path,
+            ]
+            diff_splitted_joined_translations_text = exec_process(git_diff_splitted_joined_args, git_diff_options).stdout
+            diff_body_start_pos = 0
+
+            for i in range(5):
+                diff_body_start_pos = diff_splitted_joined_translations_text.find("\n", diff_body_start_pos + 1)
+
+            diff_body_start_pos += 1
+
+            combined_splitted_joined_translations_text = re.sub(r'\x1b\[31m.*?\x1b\[m', '', diff_splitted_joined_translations_text[diff_body_start_pos:])
+            combined_splitted_joined_translations_text = re.sub(r'\x1b\[[0-9;:]*[a-zA-Z]', '', combined_splitted_joined_translations_text)
+
+            # Write temporary files for debugging
+            diff_splitted_joined_translations_text_temp_path = f"{tempdir_path}/translate-js-translation-diff-splitted-joined.txt"
+            combined_splitted_joined_translations_text_temp_path = f"{tempdir_path}/translate-js-translation-combined-splitted-joined.txt"
+
+            print(f"writing {diff_splitted_joined_translations_text_temp_path}")
+            write_file(diff_splitted_joined_translations_text_temp_path, diff_splitted_joined_translations_text)
+
+            print(f"writing {combined_splitted_joined_translations_text_temp_path}")
+            write_file(combined_splitted_joined_translations_text_temp_path, combined_splitted_joined_translations_text)
+
+        # Define a flag for debugging the diff
+        debug_diff = False
+
+        # Clean up temporary files if debugging is disabled
+        if not debug_diff:
+            # Remove temporary files
+            os.unlink(splitted_translations_text_temp_path)
+            os.unlink(joined_translations_text_temp_path)
+        else:
+            # Keep temporary files
+            print(f"keeping {splitted_translations_text_temp_path}")
+            print(f"keeping {joined_translations_text_temp_path}")
+
+            # Write more temporary files for debugging
+            diff_joined_splitted_translations_text_temp_path = f"{tempdir_path}/translate-js-translation-diff-joined-splitted.txt"
+            combined_joined_splitted_translations_text_temp_path = f"{tempdir_path}/translate-js-translation-combined-joined-splitted.txt"
+
+            print(f"writing {diff_joined_splitted_translations_text_temp_path}")
+            write_file(diff_joined_splitted_translations_text_temp_path, diff_joined_splitted_translations_text)
+
+            print(f"writing {combined_joined_splitted_translations_text_temp_path}")
+            write_file(combined_joined_splitted_translations_text_temp_path, combined_joined_splitted_translations_text)
+
+        # Split the splitted translations into a list
+        splitted_translations_list = splitted_translations_text.strip().split("\n")
+
+        # TODO rename to joined_translations_list
+        # Split the combined joined-splitted translations into a list
+        combined_joined_splitted_translations_list = combined_joined_splitted_translations_text.strip().split("\n")
+
+        last_splitted_translation_idx = -1
+
+        # TODO are these "lines" or "blocks"?
+        text_group_raw_parsed_idx = text_group_raw_parsed_idx_last
+
+        # note: textGroupRawParsedIdxLast + 1 != textGroupRawParsedList.length
+        # note: text_group_raw_parsed_idx_last + 1 != len(text_group_raw_parsed_list)
+        # ... because new values were added in the "add values to textGroupRawParsedList" loop
+        # we could also save textGroupRawParsedIdxLast before the "add values to textGroupRawParsedList" loop
+
+        text_group_raw_parsed_is_first = True
+        text_block_text_part_idx = 0
+
+        # TODO line 3030:
+        if debug_text_group_raw_parser:
+            print(f"line 3250: textGroupRawParsedIdxLast {text_group_raw_parsed_idx_last}")
+
+        # loop text parts: add aligned translations to textGroupRawParsedList
+        # for (textGroupRawParsedIdx = textGroupRawParsedIdxLast; textGroupRawParsedIdx < textGroupRawParsedList.length; textGroupRawParsedIdx++) {
+        while text_group_raw_parsed_idx < len(text_group_raw_parsed_list):
+
+            if debug_text_group_raw_parser:
+                print(f"line 3250: textGroupRawParsedIdx {text_group_raw_parsed_idx}")
+
+            if text_group_raw_parsed_is_first:
+                # continue
+                if debug_alignment:
+                    print(f"line 3260: textBlockTextPartIdxNext {text_block_text_part_idx_next} -> {text_block_text_part_idx_next_last}")
+                text_block_text_part_idx_next = text_block_text_part_idx_next_last
+                text_group_raw_parsed_is_first = False
+            else:
+                # reset
+                if debug_alignment:
+                    print(f"line 3260: textBlockTextPartIdxNext {text_block_text_part_idx_next} -> 0")
+                text_block_text_part_idx_next = 0
+
+            if debug_alignment:
+                # console.log(`translatedFileId ${String(translatedFileId).padStart(5)}   textGroupRawParsedIdx ${String(textGroupRawParsedIdx).padStart(5)}`);
+                print(f"translatedFileId {translated_file_id:5d}   textGroupRawParsedIdx {text_group_raw_parsed_idx:5d}")
+
+            text_group_raw_parsed = text_group_raw_parsed_list[text_group_raw_parsed_idx]
+            text_block_text_part_list = text_group_raw_parsed['text_block_text_part_list']
+            text_block_text_part_is_text_list = text_group_raw_parsed['text_block_text_part_is_text_list']
+            stop_loop_source_text_parts_loop = False
+
+            # parent loop
+            if debug_alignment:
+                print("line 3030: translatedFileId", translated_file_id)
+
+            # FIXME text_block_text_part_list is too long. 299 versus 3
+
+            # FIXME textGroupRawParsedIdx should be 1, is 0
+
+            # FIXME
+            # py: a=0 b=4 c=13 d=158 sourceTextLine + splittedTranslationLine = "\"beautiful women seducing pious men\"." + "„Schöne Frauen verführen fromme Männer."
+            # js: a=0 b=4 c=13 d=158 sourceTextLine + splittedTranslationLine = "\"beautiful women seducing pious men\"." + "„Schöne Frauen verführen fromme Männer\"."
+            # py should not remove the double quote # FIXME def cleanup_translation
+            # js should replace „ with double quote
+            # py: a=0 b=4 c=7 d=155 sourceTextLine + splittedTranslationLine = "literally \"little maiden\"," + "wörtlich „kleines Mädchen,"
+            # js: a=0 b=4 c=7 d=155 sourceTextLine + splittedTranslationLine = "literally \"little maiden\"," + "wörtlich „kleines Mädchen\","
+
+            if debug_alignment:
+                # FIXME
+                # py: line 3030: looping textBlockTextPartIdx from 15 to 16
+                # js: line 3030: looping textBlockTextPartIdx from 16 to 16
+                print("line 3030: looping textBlockTextPartIdx from", text_block_text_part_idx_next, "to", len(text_block_text_part_list) - 1)
+
+            if debug_alignment:
+                print(f"loop from next ...")
+
+            # loop text parts of this text block from next
+            for text_block_text_part_idx in range(text_block_text_part_idx_next, len(text_block_text_part_list)):
+
+                if debug_alignment:
+                    # console.log(`translatedFileId ${String(translatedFileId).padStart(5)}   textGroupRawParsedIdx ${String(textGroupRawParsedIdx).padStart(5)}   textBlockTextPartIdx ${String(textBlockTextPartIdx).padStart(5)}`);
+                    print(f"loop from next: translatedFileId {translated_file_id:5d}   textGroupRawParsedIdx {text_group_raw_parsed_idx:5d}   textBlockTextPartIdx {text_block_text_part_idx:5d}")
+
+                # const textBlockTextPart = textBlockTextPartList[textBlockTextPartIdx];
+                text_block_text_part = text_block_text_part_list[text_block_text_part_idx]
+
+                text_block_text_part_is_text = text_block_text_part_is_text_list[text_block_text_part_idx]
+
+                if not text_block_text_part_is_text:
+                    whitespace_part_content = text_block_text_part
+                    # read from text group raw parsed translations
+                    for translation_line_list in text_group_raw_parsed["translations"].values():
+                        # TODO translation_line_list = RandomWriteList()
+                        translation_line_list[text_block_text_part_idx] = whitespace_part_content
+                    continue
+
+                # TODO rename sourceTextLine to textBlockTextPart
+                # const sourceTextLine = textBlockTextPart;
+
+                # TODO rename source_text_line to text_block_text_part
+                #source_text_line = text_block_text_part.strip() # why strip?
+                source_text_line = text_block_text_part
+
+                translated_text_line_splitted = None
+                translated_text_line_combined_joined_splitted = None
+
+                if debug_alignment:
+                    print(f"a={translated_file_id} b={text_group_raw_parsed_idx} c={text_block_text_part_idx} textBlockTextPart {json_dumps(text_block_text_part)}")
+
+                # find translated text in splitted_translations_list
+
+                # find "splitted" translation of this source text part
+
+                #print("source_text_line", repr(source_text_line))
+
+                splitted_translation_idx = last_splitted_translation_idx + 1
+
+                # loop lines of the "splitted" translations
+                while splitted_translation_idx < len(splitted_translations_list):
+
+                    # this is always just one line (or less)
+                    splitted_translation_line = splitted_translations_list[splitted_translation_idx]
+
+                    if debug_alignment:
+                        print(f"a={translated_file_id} b={text_group_raw_parsed_idx} c={text_block_text_part_idx} d={splitted_translation_idx} sourceTextLine + splittedTranslationLine =", json_dumps(source_text_line), "+", json_dumps(splitted_translation_line))
+
+                    # start
+
+                    # source_text_line 'who are my friends,'
+                    # splitted_translation_line 'Wer sind meine Freunde,'
+
+                    # source_text_line 'team composition,'
+                    # splitted_translation_line 'Teamzusammensetzung,'
+
+                    # source_text_line 'matchmaking,'
+                    # splitted_translation_line 'Partnervermittlung,'
+
+                    # source_text_line 'offline matchmaking,'
+                    # splitted_translation_line 'Offline-Matchmaking,'
+
+                    # ...
+
+                    # source_text_line 'both are right,'
+                    # splitted_translation_line 'beide haben recht,'
+
+                    # last ok
+
+                    # source_text_line ''
+                    # splitted_translation_line '.'
 
 
+
+                    # first fail
+
+                    # source_text_line starts looping from start
+                    # splitted_translation_line contnues looping
+
+                    # source_text_line 'who are my friends,'
+                    # splitted_translation_line '.'
+
+                    # source_text_line 'team composition,'
+                    # splitted_translation_line '(starke Meinungen),'
+
+                    # source_text_line 'matchmaking,'
+                    # splitted_translation_line '(„Sie haben sich vertippt!)'
+
+                    # source_text_line 'offline matchmaking,'
+                    # splitted_translation_line 'Pallas:'
+
+                    # source_text_line 'interpersonal compatibility,'
+                    # splitted_translation_line 'Name der griechischen Göttin,'
+
+
+
+                    # source is empty line
+                    # translation is not empty line
+                    if source_text_line.strip() == "" and splitted_translation_line.strip() != "":
+                        # copy whitespace from source
+                        translated_text_line_splitted = source_text_line
+                        translated_text_line_combined_joined_splitted = source_text_line.strip()
+                        # dont use splittedTranslationLine
+                        # dont update lastSplittedTranslationIdx
+                        break
+
+                    # source is "."
+                    # translation is not "."
+                    if source_text_line == "." and not splitted_translation_line.strip() == ".":
+                        # copy "." from source
+                        translated_text_line_splitted = source_text_line
+                        translated_text_line_combined_joined_splitted = source_text_line.strip()
+                        # dont use splittedTranslationLine
+                        # dont update lastSplittedTranslationIdx
+                        break
+
+                    # source is not "."
+                    # translation is "."
+                    if source_text_line != "." and splitted_translation_line.strip() == ".":
+                        # ignore this translation
+                        splitted_translation_idx += 1
+                        continue
+
+                    translated_text_line_splitted = splitted_translation_line
+
+                    if combined_joined_splitted_translations_list[splitted_translation_idx] == None:
+                        print(f"warning: missing combined translation for {source_lang}-{target_lang}-{str(translated_file_id).zfill(3)}:{splitted_translation_idx}")
+
+                    translated_text_line_combined_joined_splitted = (combined_joined_splitted_translations_list[splitted_translation_idx] or "").strip()
+
+                    last_splitted_translation_idx = splitted_translation_idx
+                    break
+                # done: loop lines of the "splitted" translations
+
+                if debug_alignment:
+                    print(f"translatedFileId {translated_file_id:5d}   textGroupRawParsedIdx {text_group_raw_parsed_idx:5d}   textBlockTextPartIdx {text_block_text_part_idx:5d}   splittedTranslationIdx {splitted_translation_idx:5d}")
+
+                if False and source_text_line == "extended families,":
+                    raise "TODO"
+
+                if translated_text_line_splitted == None:
+                    #for idx, val in enumerate(splitted_translations_list):
+                    for idx, val in enumerate(splitted_translations_list[0:20]):
+                        print(f"splitted_translations_list[{idx}] = {repr(val)}")
+                    raise ValueError(f'not found "splitted" translation of source_text_line: {repr(source_text_line)}')
+
+                if translated_text_line_combined_joined_splitted == None:
+                    raise ValueError(f'not found "combined" translation of source_text_line: {repr(source_text_line)}')
+
+                # write to text group raw parsed translations
+                #print('text_group_raw_parsed["translations"]', repr(text_group_raw_parsed["translations"])[0:200] + " ...")
+                text_group_raw_parsed["translations"]["splittedTranslationLineList"][text_block_text_part_idx] = translated_text_line_splitted
+                text_group_raw_parsed["translations"]["joinedTranslationLineList"][text_block_text_part_idx] = translated_text_line_combined_joined_splitted
+
+            # done: loop text parts of this text block from next
+
+            if stop_loop_source_text_parts_loop:
+                break
+
+            text_group_raw_parsed_idx += 1
+
+        # done: loop text parts: add aligned translations to textGroupRawParsedList
+
+        if debug_alignment:
+            print(f"line 3500: textGroupRawParsedIdx {text_group_raw_parsed_idx}   textGroupRawParsedIdxLast {text_group_raw_parsed_idx_last}")
+
+        # undo "textGroupRawParsedIdx++" in the previous for loop
+        text_group_raw_parsed_idx_last = text_group_raw_parsed_idx - 1
+
+        if debug_alignment:
+            print(f"line 3505: textGroupRawParsedIdx {text_group_raw_parsed_idx}   textGroupRawParsedIdxLast {text_group_raw_parsed_idx_last}")
+
+        if debug_alignment:
+            print(f"line 3510: textBlockTextPartIdxNextLast {text_block_text_part_idx_next_last} -> {text_block_text_part_idx + 1}")
+
+        # FIXME text_block_text_part_idx is 1 too small
+        #text_block_text_part_idx_next_last = text_block_text_part_idx
+        # +1:
+        # in javascript, textBlockTextPartIdx was incremented after the last iteration
+        # of "loop text parts of this text block from next"
+        # textBlockTextPartIdx++
+        # in python, text_block_text_part_idx was *not* incremented after the last iteration
+        text_block_text_part_idx_next_last = text_block_text_part_idx + 1
+
+    # done: loop input files: add source and translated text parts to textGroupRawParsed
+
+    print("populating textGroupRawParsedList done")
+
+
+
+    print("autofixing and autosolving translations ...")
+
+    # TODO move out
+    def autofix_translations(source_text, translated_text_list, target_lang):
+        if target_lang == "en":
+            # Define a mapping of contractions to their expanded forms
+            contraction_mapping = {
+                r"\b(i|you|he|she|it|we|they)'ll\b": r"\1 will",
+                r"\b(w)on't\b": r"\1ill not",
+                r"\b(c)an't\b": r"\1an not",
+                r"\b(do|does|did|is|was|were|should|could|have|would|are)n't\b": r"\1 not",
+                r"\b(i|you|they|we)'ve\b": r"\1 have",
+                r"\b(i|you|he|she|it|we|they)'d\b": r"\1 would",
+                r"\b(who|that|there|what|it)'s\b": r"\1 is",
+                r"\b(i)'m\b": r"\1 am",
+                r"\b(you|we|they)'re\b": r"\1 are",
+                r"\b(he|she|it)'s\b": r"\1 is",
+                r"\b(let)'s\b": r"\1 us"
+                # Add more contractions as needed
+            }
+
+            # Iterate through each translated text and apply fixes
+            for idx, translated_text in enumerate(translated_text_list):
+                for pattern, replacement in contraction_mapping.items():
+                    translated_text_list[idx] = re.sub(pattern, replacement, translated_text, flags=re.IGNORECASE)
+
+        return translated_text_list
+    # done: def autofix_translations
+
+
+
+    # autosolve translations
+    def autosolve_translations(source_text, translated_text_list):
+        if len(translated_text_list) <= 1:
+            # 0 or 1 translation. no translations to compare
+            if debug_alignment:
+                print("3670 autosolveTranslations 1")
+            return translated_text_list
+
+        # source and translations are equal
+        for translated_text in translated_text_list:
+            if translated_text == source_text:
+                if debug_alignment:
+                    print("3670 autosolveTranslations 2")
+                return [translated_text]
+
+        # all translations are equal
+        if all(translated_text == translated_text_list[0] for translated_text in translated_text_list):
+            if debug_alignment:
+                print("3670 autosolveTranslations 3")
+            return [translated_text_list[0]]
+
+        if debug_alignment:
+            print("3670 autosolveTranslations 4")
+
+        # Check for trivial differences
+        end_punctuation_regex = r'[.,?!" ]+$'
+        only_punctuation_regex = r'^[.,?!" ]+$'
+
+        # get line end punctuation
+        def get_line_end_punctuation(line):
+            match = re.search(end_punctuation_regex, line)
+            return match.group(0) if match else None
+
+        source_text_end_punctuation = get_line_end_punctuation(source_text)
+
+        if debug_alignment:
+            print(f"3710 autosolveTranslations 4 sourceTextEndPunctuation {json_dumps(source_text_end_punctuation)}")
+
+        if source_text_end_punctuation:
+
+            # source line ends with punctuation
+
+            # prefer translations that also end with the same punctuation
+            # but otherwise have the same prefix
+
+            # example:
+            # de-en-000:70:
+            #   s: Nur wenige Weltbilder geben eine Antwort,
+            #   t: Only a few worldviews provide an answer
+            #   t: Only a few worldviews provide an answer,
+
+            filtered_translated_text_list = translated_text_list[:]
+
+            for translated_text in translated_text_list:
+
+                if not translated_text.endswith(source_text_end_punctuation):
+                    if debug_alignment:
+                        print("3670 autosolveTranslations 4 1")
+                    continue
+
+                # translatedText has same end punctuation as sourceText
+                # remove other translated texts that only differ in end punctuation
+
+                translated_text_before_end_punctuation = translated_text[:(-1 * len(source_text_end_punctuation))]
+
+                if debug_alignment:
+                    print(f"3670 autosolveTranslations 4 1 translatedTextBeforeEndPunctuation {json_dumps(translated_text_before_end_punctuation)}")
+
+                def filter_translated_text(translated_text_2):
+                    if (
+                        not translated_text_2.startswith(translated_text_before_end_punctuation)
+                        or
+                        translated_text_2 == translated_text
+                    ):
+                        if debug_alignment:
+                            print("3670 autosolveTranslations 4 2")
+                        return True # keep translation
+
+                    #   translatedText2 has same prefix as translatedText, but a different suffix
+                    suffix = translated_text_2[len(translated_text_before_end_punctuation):]
+                    if (
+                        suffix == "" or
+                        re.match(only_punctuation_regex, suffix)
+                    ):
+                        # suffix has no words
+                        if debug_alignment:
+                            print("3670 autosolveTranslations 4 3")
+                        return False # remove translation
+                    # suffix has words
+                    if debug_alignment:
+                        print("3670 autosolveTranslations 4 4")
+                    return True # keep translation
+
+                filtered_translated_text_list = list(filter(
+                    filter_translated_text,
+                    filtered_translated_text_list
+                ))
+            translated_text_list = filtered_translated_text_list
+
+            if debug_alignment:
+                print("3670 autosolveTranslations 5")
+
+            # add missing end punctuation to translated texts
+            # de-en-000:89:
+            #   s: Wie müssen wir verschiedene Menschen verbinden,
+            #   t: How do we need to connect different people
+            #   t: How do we have to connect different people,
+
+            def map_translated_text(translated_text):
+                if translated_text.endswith(source_text_end_punctuation):
+                    return translated_text # no change
+                suffix = get_line_end_punctuation(translated_text)
+                if suffix == None:
+                    # translated text does NOT end with punctuation
+                    # add end punctuation
+                    return translated_text + source_text_end_punctuation
+                return translated_text # no change
+
+            translated_text_list = list(map(
+                map_translated_text,
+                translated_text_list
+            ))
+
+        else:
+
+            if debug_alignment:
+                print("3670 autosolveTranslations 6")
+
+            # source line does not end with punctuation
+
+            # sourceTextEndPunctuation == undefined
+            # source line does NOT end with punctuation
+
+            # prefer translations that also do NOT end with punctuation
+            # but otherwise have the same prefix
+
+            # example:
+            # de-en-000:27:
+            #   s: Wer sind meine Freunde
+            #   t: Who are my friends
+            #   t: Who are my friends?
+
+            filtered_translated_text_list = translated_text_list[:]
+            for translated_text in translated_text_list:
+                translated_text_end_punctuation = get_line_end_punctuation(translated_text)
+                if translated_text_end_punctuation != None:
+                    if debug_alignment:
+                        print(f"3670 autosolveTranslations 6 1 translatedTextEndPunctuation {json_dumps(translated_text_end_punctuation)}")
+                    continue
+                if debug_alignment:
+                    print(f"3670 autosolveTranslations 6 1 translatedText {json_dumps(translated_text)}")
+                # translated_text_end_punctuation == None
+                # translatedText also has NO end punctuation
+                # remove other translated texts that only differ in end punctuation
+                def filter_translated_text(translated_text_2):
+                    if debug_alignment:
+                        print(f"3670 autosolveTranslations 6 1.5 translatedText2 {json_dumps(translated_text_2)}")
+                    if translated_text_2 == translated_text:
+                        if debug_alignment:
+                            print("3670 autosolveTranslations 6 2")
+                        return True # keep translation
+                    if translated_text_2.startswith(translated_text):
+                        # translatedText2 has same prefix as translatedText, but a different suffix
+                        if debug_alignment:
+                            print("3670 autosolveTranslations 6 3")
+                        return False # remove translation
+                    if debug_alignment:
+                        print("3670 autosolveTranslations 6 4")
+                    return True # keep translation
+                # force eval of filter here
+                # to get the same output as the js version
+                filtered_translated_text_list = list(filter(
+                    filter_translated_text,
+                    filtered_translated_text_list
+                ))
+            translated_text_list = filtered_translated_text_list
+
+        return translated_text_list
+    # done: def autosolve_translations
+
+
+
+    text_group_raw_parsed_last = None  # debug
+
+    # loop text blocks: autofix and autosolve translations in textGroupRawParsed
+    for text_block_idx, text_group_raw_parsed in enumerate(text_group_raw_parsed_list):
+        if debug_alignment:
+            print(f"textBlockIdx {str(text_block_idx).rjust(5)}")
+        text_block_text_part_list = text_group_raw_parsed["text_block_text_part_list"]
+
+        if debug_alignment:
+            print(f"loop from first ...")
+
+        # loop text parts of this text block from first
+        for text_block_text_part_idx, text_block_text_part in enumerate(text_block_text_part_list):
+
+            if debug_alignment:
+                print(f"loop from first: textBlockIdx {str(text_block_idx).rjust(5)}   textBlockTextPartIdx {str(text_block_text_part_idx).rjust(5)}   (translatedFileId {str(text_group_raw_parsed['translated_file_id']).rjust(5)})")
+
+            source_text_line = text_block_text_part.strip()
+
+            source_text_line_trimmed = text_block_text_part.strip()
+
+            if debug_alignment:
+                print(f"3550 sourceTextLineTrimmed {json_dumps(source_text_line_trimmed)}")
+
+            if (
+                # this part is whitespace only
+                not text_group_raw_parsed["text_block_text_part_is_text_list"][text_block_text_part_idx] or
+                # this part is punctuation only
+                source_text_line in [".", ",", ":"]
+                # TODO exclude more?
+            ):
+                continue
+
+            # read from text group raw parsed translations
+            translated_text_line_splitted = text_group_raw_parsed["translations"]["splittedTranslationLineList"][text_block_text_part_idx]
+            translated_text_line_combined_joined_splitted = text_group_raw_parsed["translations"]["joinedTranslationLineList"][text_block_text_part_idx]
+
+            # debug
+            # if debug_alignment and text_group_raw_parsed["translatedFileId"] >= 82:
+            #     print(f"textBlockIdx {text_block_idx}")
+            #     print(text_group_raw_parsed)
+
+            if translated_text_line_combined_joined_splitted is None:
+                print(
+                    f"Translated text line combined joined splitted is None. Block Idx: {text_block_idx}, Text Group Raw Parsed: {text_group_raw_parsed}, Text Block Text Part Idx: {text_block_text_part_idx}, Translated Text Line Combined Joined Splitted: {translated_text_line_combined_joined_splitted}, Translated Text Line Splitted: {translated_text_line_splitted}"
+                )
+                raise ValueError("Translated text line combined joined splitted is None")
+
+            if translated_text_line_splitted is None:
+                print(
+                    f"Translated text line splitted is None. Block Idx: {text_block_idx}, Text Group Raw Parsed: {text_group_raw_parsed}, Text Block Text Part Idx: {text_block_text_part_idx}, Translated Text Line Combined Joined Splitted: {translated_text_line_combined_joined_splitted}, Translated Text Line Splitted: {translated_text_line_splitted}"
+                )
+                raise ValueError("Translated text line splitted is None")
+
+            #translated_text_part_list = []
+
+            translated_text_line_list = [translated_text_line_combined_joined_splitted, translated_text_line_splitted]
+
+            if debug_alignment:
+                print("3840 sourceTextLineTrimmed", json_dumps(source_text_line_trimmed))
+                print("3840 translatedTextLineList", json_dumps(translated_text_line_list))
+
+            # first autofix, then autosolve
+            # because autofix can produce more identical translations
+            # which are then reduced by autosolve
+
+            translated_text_line_list = autofix_translations(source_text_line_trimmed, translated_text_line_list, target_lang)
+
+            if debug_alignment:
+                print("3845 translatedTextLineList", json_dumps(translated_text_line_list))
+
+            # FIXME returns empty
+            translated_text_line_list = autosolve_translations(source_text_line_trimmed, translated_text_line_list)
+
+            if debug_alignment:
+                print("3850 translatedTextLineList", json_dumps(translated_text_line_list))
+
+            # write to text group raw parsed translations
+            # Write back to textGroupRawParsed.translations
+            # First translation in translatedTextLineList is the "joined" translation
+            # textGroupRawParsed.translations.joinedTranslationLineList[textBlockTextPartIdx] = (
+            text_group_raw_parsed["translations"]["joinedTranslationLineList"][text_block_text_part_idx] = (
+                translated_text_line_list[0]
+            )
+            # Second translation in translatedTextLineList is the "splitted" translation
+            # If it was removed by autosolve, then just copy the "joined" translation
+            # textGroupRawParsed.translations.splittedTranslationLineList[textBlockTextPartIdx] = (
+            text_group_raw_parsed["translations"]["splittedTranslationLineList"][text_block_text_part_idx] = (
+                # FIXME index error: translated_text_line_list[1]
+                #translated_text_line_list[1] or translated_text_line_list[0]
+                translated_text_line_list[1] if len(translated_text_line_list) > 1 else translated_text_line_list[0]
+            )
+
+            # textGroupRawParsedLast = textGroupRawParsed;
+
+        # done: loop text parts of this text block from first
+
+    # done: loop text blocks: autofix and autosolve translations in textGroupRawParsed
+
+
+
+    print("autofixing and autosolving translations done")
+    # TODO use translatedTextLineList
+
+
+
+    # Debug: Write textGroupRawParsedList to a JSON file
+    text_group_raw_parsed_list_path = "debug-textGroupRawParsedList.json"
+    print(f"writing {text_group_raw_parsed_list_path}")
+    with open(text_group_raw_parsed_list_path, "w") as json_file:
+        json.dump(text_group_raw_parsed_list, json_file, indent=2, ensure_ascii=False)
+
+    # Transform textGroupRawParsedList to an object using sourceTextBlockHash as key
+    # Assuming sourceTextBlockHash is available in textGroupRawParsedList
+
+    text_group_raw_parsed_dict = {}
+    for text_group_raw_parsed in text_group_raw_parsed_list:
+        text_group_raw_parsed_dict[text_group_raw_parsed["source_text_block_hash"]] = text_group_raw_parsed
+
+    # Main loop: textToTranslateList + htmlBetweenReplacementsList
+    # Write HTML by looping through source text list and getting translations from translatedTextLineListByInputFileList
+
+    # Debug: Compare translations in plain text format
+    # Make something similar in HTML where we see vertical stacks of source text and translation candidates
+    # Let's assume we have a function to generate HTML comparison
+
+    # Assuming generate_html_comparison() is a function to generate HTML comparison
+    # html_comparison = generate_html_comparison(source_text_list, translated_text_line_list_by_input_file_list)
+    # translated_text += html_comparison.translated_text
+
+    translated_html = io.StringIO()
+    translated_splitted_html = io.StringIO()
+
+    # Main loop to reconstruct HTML
+    for text_to_translate_idx, text_to_translate_entry in enumerate(text_to_translate_list):
+        html_before_text = html_between_replacements_list[text_to_translate_idx]
+        translated_html.write(html_before_text)
+        translated_splitted_html.write(html_before_text)
+
+        _idx, source_hash, source_lang, source_text, todo_remove_end_of_sentence, todo_add_to_translations_database = text_to_translate_entry
+
+        translated_text_block_text = None
+        translated_splitted_text_block_text = None
+
+        if source_hash == "":
+            translated_text_block_text = ""
+
+        if translated_text_block_text is None:
+            # translation_key = f"{source_lang}:{target_lang}:{source_hash}"
+            # translated_text_block_text = translations_database.get(translation_key, [])[1]
+            joined_splitted = translations_db.get_target_text(
+                source_lang,
+                source_hash,
+                target_lang,
+                translator_name
+            )
+            if joined_splitted:
+                #print("joined_splitted", repr(joined_splitted))
+                joined_translation_block_text, splitted_translation_block_text = joined_splitted
+                translated_text_block_text = joined_translation_block_text
+                if joined_translation_block_text != splitted_translation_block_text:
+                    translated_splitted_text_block_text = splitted_translation_block_text
+
+        if translated_text_block_text is None:
+            text_group_raw_parsed = next(
+                (parsed_group for parsed_group in text_group_raw_parsed_list if parsed_group["source_text_block_hash"] == source_hash),
+                None
+            )
+            if text_group_raw_parsed is None:
+                print({
+                    "text_to_translate_idx": text_to_translate_idx,
+                    "source_hash": source_hash,
+                    "source_lang": source_lang,
+                    "source_text": source_text,
+                    "todo_remove_end_of_sentence": todo_remove_end_of_sentence,
+                    "todo_add_to_translations_database": todo_add_to_translations_database,
+                })
+                raise ValueError("TODO find translation in translated_text_line_list_by_input_file_list")
+
+            # read from text group raw parsed translations
+            joined_translation_block_text = "".join(text_group_raw_parsed["translations"]["joinedTranslationLineList"])
+            splitted_translation_block_text = "".join(text_group_raw_parsed["translations"]["splittedTranslationLineList"])
+
+            translations_db.add_target_text(
+                source_lang,
+                source_hash,
+                target_lang,
+                translator_name,
+                joined_translation_block_text,
+                splitted_translation_block_text
+            )
+
+            translated_text_block_text = joined_translation_block_text
+
+            if joined_translation_block_text != splitted_translation_block_text:
+                translated_splitted_text_block_text = splitted_translation_block_text
+
+        if translated_text_block_text is None:
+            print({
+                "text_to_translate_idx": text_to_translate_idx,
+                "source_hash": source_hash,
+                "source_lang": source_lang,
+                "source_text": source_text,
+                "todo_remove_end_of_sentence": todo_remove_end_of_sentence,
+                "todo_add_to_translations_database": todo_add_to_translations_database,
+            })
+            raise ValueError("FIXME missing translation for this text block")
+
+        translated_html.write(translated_text_block_text)
+
+        if translated_splitted_text_block_text is None:
+            translated_splitted_html.write(translated_text_block_text)
+        else:
+            translated_splitted_html.write(translated_splitted_text_block_text)
+    # done: Main loop to reconstruct HTML
+
+    # Add last HTML chunk
+    translated_html.write(html_between_replacements_list[-1])
+    translated_splitted_html.write(html_between_replacements_list[-1])
+
+    translated_html = translated_html.getvalue()
+    translated_splitted_html = translated_splitted_html.getvalue()
+
+    # Write to files
+    print(f"writing {translated_html_path}")
+    with open(translated_html_path, "w") as html_file:
+        html_file.write(translated_html)
+
+    print(f"writing {translated_splitted_html_path}")
+    with open(translated_splitted_html_path, "w") as splitted_html_file:
+        splitted_html_file.write(translated_splitted_html)
+
+    return input_path_frozen
+
+
+
+# TODO remove? python version is using sqlite database
 
 def parse_translations_database(translations_database, translations_database_text):
+
     def sha1sum(text):
         return 'sha1-' + hashlib.sha1(text.encode('utf-8')).hexdigest()
 
@@ -2168,8 +3403,11 @@ def parse_translations_database(translations_database, translations_database_tex
         source_hash_actual = sha1sum(source_text)
         if source_hash != source_hash_actual:
             print(f"error: parseTranslationsDatabase: sourceHash != sourceHashActual: {source_hash} != {source_hash_actual}: sourceText = {source_text[:100]} ...", file=sys.stderr)
-            raise value_error("fixme")
+            raise ValueError("fixme")
         translations_database[translation_key] = [source_text, translated_text]
+        # source_text_hash_bytes = bytes.fromhex(source_hash)
+        # target_text = translated_text
+        # translations_db_set(source_lang, target_lang, source_text_hash_bytes, source_text, target_text)
         return ""
 
     translations_database_text = re.sub(
@@ -2184,7 +3422,137 @@ def parse_translations_database(translations_database, translations_database_tex
 
 
 
+async def translate_lang(input_path, target_lang, output_dir):
+
+    print(f"reading {input_path}")
+    with open(input_path, 'r') as file:
+        input_html_bytes = file.read()
+    input_html_hash = 'sha1-' + hashlib.sha1(input_html_bytes.encode('utf-8')).hexdigest()
+
+    output_dir = os.path.join(os.path.dirname(input_path), output_dir)
+
+    if input_path.endswith(input_html_hash):
+        # input path is already frozen
+        input_path_frozen = input_path
+    else:
+        input_path_frozen = output_dir + os.path.basename(input_path) + '.' + input_html_hash
+
+    # TODO rename input_path_frozen to output_base
+    output_base = input_path_frozen
+
+    translate_url_list_path = output_base + f".translateUrlList-{target_lang}.json"
+    print(f"reading {translate_url_list_path}")
+    with open(translate_url_list_path, 'r') as file:
+        translate_url_list = json.load(file)
+
+    translate_url_list_filtered = []
+
+    for translate_item in translate_url_list:
+
+        # link_id:
+        # 0000-joined
+        # 0000-splitted
+        # ...
+
+        link_id, translate_url = translate_item
+
+        translation_output_path = f"{output_base}.{link_id}.txt"
+
+        if os.path.exists(translation_output_path):
+            print(f"keeping output: {translation_output_path}")
+            continue
+
+        translate_url_list_filtered.append(translate_item)
+
+    if len(translate_url_list_filtered) == 0:
+        return input_path_frozen
+    
+    print("len(translate_url_list_filtered)", len(translate_url_list_filtered))
+    
+    raise "FIXME" # dont reach this
+
+    translate_url_list = translate_url_list_filtered
+
+    print("starting chromium")
+
+    chrome_options = webdriver.ChromeOptions()
+
+    async with webdriver.Chrome(options=chrome_options) as driver:
+
+        print("starting chromium done")
+        await driver.sleep(10)
+
+        # on first visit, autosolve "Before you continue to Google" popup
+        print("autosolving accept-terms popup")
+        url = "https://translate.google.com/"
+        await driver.get(url)
+        # <span jsname="V67aGc" class="VfPpkd-vQzf8d">Accept all</span>
+        accept_all = await driver.find_element(By.XPATH, "//span[text()='Accept all']")
+        await accept_all.click()
+        # wait for page load
+        await driver.sleep(10)
+
+        for translate_item in translate_url_list:
+
+            # link_id:
+            # 0000-joined
+            # 0000-splitted
+            # ...
+
+            link_id, translate_url = translate_item
+
+            translation_output_path = f"{output_base}.{link_id}.txt"
+
+            if os.path.exists(translation_output_path):
+                print(f"keeping output: {translation_output_path}")
+                continue
+
+            print(f"translating group {link_id}")
+
+            await driver.get(translate_url)
+
+            # wait for page load
+            await driver.sleep(10)
+
+            # override the "set clipboard" function
+            print("overriding navigator.clipboard.writeText")
+            await driver.execute_script(
+                "navigator.clipboard.writeText = (text) => globalThis._clipboard = text;"
+            )
+
+            print(f"clicking copy translation")
+            # click <button aria-label="Copy translation"
+            # selenium_driverless.types.webelement.NoSuchElementException
+            copy_translation = await driver.find_element(By.XPATH, "//button[@aria-label='Copy translation']", timeout=120)
+            await copy_translation.click()
+
+            # wait for clipboard
+            await driver.sleep(5)
+
+            print(f"getting clipboard")
+            target_text = await driver.execute_script(
+                "return globalThis._clipboard"
+            )
+            print("target_text", target_text[:50] + " ...")
+
+            print(f"writing {translation_output_path}")
+            with open(translation_output_path, "w") as f:
+                f.write(target_text)
+
+            # use ascii doublequotes
+            # TODO use code from import_lang
+            #clipboard = clipboard.replace('„', '"').replace('“', '"')
+
+            # give translator some time to chill
+            # avoid getting blocked by rate limiting
+            await driver.sleep(10)
+
+    return input_path_frozen
+
+
+
 async def main():
+
     lang_map = {
         # simplified chinese
         'zh': 'zh-CN',
@@ -2215,9 +3583,32 @@ async def main():
         return 1
 
     if translations_path_list:
-        return await import_lang(input_path, target_lang, translations_path_list, output_dir)
-    else:
-        return await export_lang(input_path, target_lang, output_dir)
+        return await import_lang(input_path, target_lang, output_dir, translations_path_list)
+
+    input_path_frozen = await export_lang(input_path, target_lang, output_dir)
+
+    input_path = input_path_frozen
+    output_dir = ""
+
+    await translate_lang(input_path, target_lang, output_dir)
+
+    # .translation-en-de-0001-joined.txt
+    # .translation-en-de-0001-splitted.txt
+    # ...
+
+    # TODO filter more? glob pattern may be too lax
+    # see also translations_base_name_match
+
+    # sorting is done by import_lang
+    #translations_path_list = sorted(glob.glob(input_path_frozen + f".translation-*-*-*-*.txt"))
+
+    translations_path_list = glob.glob(input_path_frozen + f".translation-*-*-*-*.txt")
+
+    translations_path_list_len = len(translations_path_list)
+
+    assert translations_path_list_len % 2 == 0, f"unexpected translations_path_list_len {translations_path_list_len}"
+
+    await import_lang(input_path, target_lang, output_dir, translations_path_list)
 
 
 
